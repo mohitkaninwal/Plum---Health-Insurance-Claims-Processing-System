@@ -165,8 +165,11 @@ class TraceEvent(BaseModel):
     message: str
     input_summary: dict[str, Any] = Field(default_factory=dict)
     output_summary: dict[str, Any] = Field(default_factory=dict)
+    checks_performed: list[str] = Field(default_factory=list)
     evidence_ids: list[str] = Field(default_factory=list)
     confidence_impact: float = 0
+    warnings: list[str] = Field(default_factory=list)
+    errors: list[str] = Field(default_factory=list)
 
 
 class ClaimDecision(BaseModel):

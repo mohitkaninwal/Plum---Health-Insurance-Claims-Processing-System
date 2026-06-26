@@ -133,6 +133,56 @@ def test_clean_consultation_applies_copay() -> None:
     assert payload["extracted_document_data"][0]["fields"]["diagnosis"] == "Viral Fever"
 
 
+def test_completed_claim_includes_confidence_and_decision_explainability_trace() -> None:
+    client = TestClient(app)
+
+    response = client.post(
+        "/claims/submit",
+        json={
+            "member_id": "EMP001",
+            "policy_id": "PLUM_GHI_2024",
+            "claim_category": "CONSULTATION",
+            "treatment_date": "2024-11-01",
+            "claimed_amount": 1500,
+            "documents": [
+                {
+                    "file_id": "F007",
+                    "actual_type": "PRESCRIPTION",
+                    "quality": "GOOD",
+                    "content": {"patient_name": "Rajesh Kumar", "diagnosis": "Viral Fever"},
+                },
+                {
+                    "file_id": "F008",
+                    "actual_type": "HOSPITAL_BILL",
+                    "quality": "GOOD",
+                    "content": {"patient_name": "Rajesh Kumar", "total": 1500},
+                },
+            ],
+        },
+    )
+
+    payload = response.json()
+    confidence_trace = next(item for item in payload["trace"] if item["component"] == "ConfidenceScorer")
+    explanation_trace = next(item for item in payload["trace"] if item["component"] == "DecisionExplainer")
+
+    assert confidence_trace["checks_performed"] == [
+        "document_quality",
+        "extraction_completeness",
+        "patient_consistency",
+        "policy_evidence_strength",
+        "rule_certainty",
+        "component_failures",
+    ]
+    assert confidence_trace["output_summary"]["confidence_score"] == payload["confidence_score"]
+    assert explanation_trace["input_summary"]["documents_checked"][0]["file_id"] == "F007"
+    assert explanation_trace["input_summary"]["extracted_fields"][0]["fields"] == [
+        "diagnosis",
+        "patient_name",
+    ]
+    assert explanation_trace["output_summary"]["amount_calculation"]["approved_amount"] == 1350
+    assert explanation_trace["evidence_ids"]
+
+
 def test_extraction_pipeline_stops_for_normalized_patient_mismatch() -> None:
     client = TestClient(app)
 

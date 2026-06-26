@@ -18,6 +18,7 @@ from app.models import (
     EvalCaseResult,
     EvalMetrics,
     EvalRun,
+    ExtractedDocumentData,
     LineItemDecision,
     LineItemDecisionType,
     MemberActionRequired,
@@ -49,6 +50,8 @@ def process_claim(submission: ClaimSubmission, policy: PolicyTerms | None = None
                     "submission_policy_id": submission.policy_id,
                     "loaded_policy_id": policy.policy_id,
                 },
+                checks_performed=["policy_id_matches_active_policy"],
+                confidence_impact=-0.01,
             )
         ]
         return _rejected(
@@ -57,7 +60,7 @@ def process_claim(submission: ClaimSubmission, policy: PolicyTerms | None = None
             _policy_evidence(submission, policy),
             ["POLICY_MISMATCH"],
             f"Claim references policy {submission.policy_id}, but the active policy is {policy.policy_id}.",
-            confidence=0.99,
+            confidence=_confidence_score(submission, [], [], rule_certainty_impact=-0.01),
         )
 
     trace: list[TraceEvent] = [
@@ -71,6 +74,7 @@ def process_claim(submission: ClaimSubmission, policy: PolicyTerms | None = None
                 "claimed_amount": submission.claimed_amount,
                 "document_count": len(submission.documents),
             },
+            checks_performed=["required_submission_fields_present"],
         )
     ]
     evidence = _policy_evidence(submission, policy)
@@ -84,6 +88,28 @@ def process_claim(submission: ClaimSubmission, policy: PolicyTerms | None = None
     trace.extend(extraction_result.trace)
     if extraction_result.member_action_required is not None:
         message = extraction_result.member_action_required.message
+        trace.append(
+            TraceEvent(
+                component="ConfidenceScorer",
+                level=TraceLevel.WARNING,
+                message="Confidence not finalized because the claim requires member action before adjudication.",
+                input_summary=_confidence_inputs(
+                    submission,
+                    evidence,
+                    extraction_result.extracted_documents,
+                    extraction_result.component_failures,
+                ),
+                output_summary={"status": ClaimStatus.ACTION_REQUIRED},
+                checks_performed=[
+                    "document_quality",
+                    "extraction_completeness",
+                    "patient_consistency",
+                    "policy_evidence_strength",
+                    "component_failures",
+                ],
+                confidence_impact=extraction_result.confidence_impact,
+            )
+        )
         return ClaimResponse(
             status=ClaimStatus.ACTION_REQUIRED,
             submission=submission,
@@ -96,6 +122,13 @@ def process_claim(submission: ClaimSubmission, policy: PolicyTerms | None = None
         )
 
     member = _member_for(submission.member_id, policy)
+    component_failures: list[ComponentFailure] = list(extraction_result.component_failures)
+    confidence = _confidence_score(
+        submission,
+        evidence,
+        extraction_result.extracted_documents,
+        component_failures,
+    )
     if member is None:
         return _rejected(
             submission,
@@ -103,8 +136,14 @@ def process_claim(submission: ClaimSubmission, policy: PolicyTerms | None = None
             evidence,
             ["MEMBER_NOT_FOUND"],
             f"Member {submission.member_id} is not listed under policy {policy.policy_id}.",
-            confidence=0.98,
-            component_failures=extraction_result.component_failures,
+            confidence=_confidence_score(
+                submission,
+                evidence,
+                extraction_result.extracted_documents,
+                component_failures,
+                rule_certainty_impact=-0.02,
+            ),
+            component_failures=component_failures,
             extracted_document_data=extraction_result.extracted_documents,
         )
 
@@ -116,8 +155,14 @@ def process_claim(submission: ClaimSubmission, policy: PolicyTerms | None = None
             evidence,
             ["POLICY_NOT_ACTIVE"],
             policy_validity_reason,
-            confidence=0.98,
-            component_failures=extraction_result.component_failures,
+            confidence=_confidence_score(
+                submission,
+                evidence,
+                extraction_result.extracted_documents,
+                component_failures,
+                rule_certainty_impact=-0.02,
+            ),
+            component_failures=component_failures,
             extracted_document_data=extraction_result.extracted_documents,
         )
 
@@ -129,8 +174,14 @@ def process_claim(submission: ClaimSubmission, policy: PolicyTerms | None = None
             evidence,
             ["SUBMISSION_RULE_FAILED"],
             submission_rules_reason,
-            confidence=0.96,
-            component_failures=extraction_result.component_failures,
+            confidence=_confidence_score(
+                submission,
+                evidence,
+                extraction_result.extracted_documents,
+                component_failures,
+                rule_certainty_impact=-0.03,
+            ),
+            component_failures=component_failures,
             extracted_document_data=extraction_result.extracted_documents,
         )
 
@@ -142,13 +193,17 @@ def process_claim(submission: ClaimSubmission, policy: PolicyTerms | None = None
             evidence,
             ["CATEGORY_NOT_COVERED"],
             category_reason,
-            confidence=0.96,
-            component_failures=extraction_result.component_failures,
+            confidence=_confidence_score(
+                submission,
+                evidence,
+                extraction_result.extracted_documents,
+                component_failures,
+                rule_certainty_impact=-0.03,
+            ),
+            component_failures=component_failures,
             extracted_document_data=extraction_result.extracted_documents,
         )
 
-    component_failures: list[ComponentFailure] = list(extraction_result.component_failures)
-    confidence = max(0.5, min(0.99, 0.93 + extraction_result.confidence_impact))
     if submission.simulate_component_failure:
         component_failures.append(
             ComponentFailure(
@@ -156,13 +211,21 @@ def process_claim(submission: ClaimSubmission, policy: PolicyTerms | None = None
                 message="Hybrid retrieval timed out; deterministic policy checks continued.",
             )
         )
-        confidence = 0.72
+        confidence = _confidence_score(
+            submission,
+            evidence,
+            extraction_result.extracted_documents,
+            component_failures,
+            rule_certainty_impact=-0.04,
+        )
         trace.append(
             TraceEvent(
                 component="PolicyEvidenceRetriever",
                 level=TraceLevel.WARNING,
                 message="Recoverable component failure recorded; adjudication continued.",
-                confidence_impact=-0.16,
+                checks_performed=["hybrid_policy_retrieval"],
+                confidence_impact=-0.12,
+                warnings=["Hybrid retrieval timed out; deterministic policy checks continued."],
             )
         )
 
@@ -176,7 +239,13 @@ def process_claim(submission: ClaimSubmission, policy: PolicyTerms | None = None
             evidence,
             ["EXCLUDED_CONDITION"],
             exclusion_reason,
-            confidence=0.94,
+            confidence=_confidence_score(
+                submission,
+                evidence,
+                extraction_result.extracted_documents,
+                component_failures,
+                rule_certainty_impact=0.05,
+            ),
             component_failures=component_failures,
             extracted_document_data=extraction_result.extracted_documents,
         )
@@ -189,7 +258,13 @@ def process_claim(submission: ClaimSubmission, policy: PolicyTerms | None = None
             evidence,
             ["EXCLUDED_VISION_ITEM"],
             vision_exclusion_reason,
-            confidence=0.94,
+            confidence=_confidence_score(
+                submission,
+                evidence,
+                extraction_result.extracted_documents,
+                component_failures,
+                rule_certainty_impact=0.05,
+            ),
             component_failures=component_failures,
             extracted_document_data=extraction_result.extracted_documents,
         )
@@ -202,7 +277,13 @@ def process_claim(submission: ClaimSubmission, policy: PolicyTerms | None = None
             evidence,
             ["WAITING_PERIOD"],
             waiting_reason,
-            confidence=0.91,
+            confidence=_confidence_score(
+                submission,
+                evidence,
+                extraction_result.extracted_documents,
+                component_failures,
+                rule_certainty_impact=-0.07,
+            ),
             component_failures=component_failures,
             extracted_document_data=extraction_result.extracted_documents,
         )
@@ -215,7 +296,13 @@ def process_claim(submission: ClaimSubmission, policy: PolicyTerms | None = None
             evidence,
             ["PRE_AUTH_MISSING"],
             pre_auth_reason,
-            confidence=0.9,
+            confidence=_confidence_score(
+                submission,
+                evidence,
+                extraction_result.extracted_documents,
+                component_failures,
+                rule_certainty_impact=-0.08,
+            ),
             component_failures=component_failures,
             extracted_document_data=extraction_result.extracted_documents,
         )
@@ -225,7 +312,13 @@ def process_claim(submission: ClaimSubmission, policy: PolicyTerms | None = None
         decision = ClaimDecision(
             decision=ClaimDecisionType.MANUAL_REVIEW,
             approved_amount=0,
-            confidence_score=0.82,
+            confidence_score=_confidence_score(
+                submission,
+                evidence,
+                extraction_result.extracted_documents,
+                component_failures,
+                rule_certainty_impact=-0.14,
+            ),
             reason=fraud_reason,
         )
         trace.append(
@@ -234,7 +327,9 @@ def process_claim(submission: ClaimSubmission, policy: PolicyTerms | None = None
                 level=TraceLevel.WARNING,
                 message="Claim routed to manual review due to fraud signals.",
                 output_summary={"signals": [fraud_reason]},
-                confidence_impact=-0.08,
+                checks_performed=["same_day_claim_count", "high_value_manual_review_threshold"],
+                confidence_impact=-0.14,
+                warnings=[fraud_reason],
             )
         )
         return _completed_response(
@@ -259,7 +354,13 @@ def process_claim(submission: ClaimSubmission, policy: PolicyTerms | None = None
                 f"Claimed amount INR {submission.claimed_amount:.0f} exceeds the per-claim "
                 f"limit of INR {policy.coverage.per_claim_limit:.0f}."
             ),
-            confidence=0.92,
+            confidence=_confidence_score(
+                submission,
+                evidence,
+                extraction_result.extracted_documents,
+                component_failures,
+                rule_certainty_impact=-0.06,
+            ),
             component_failures=component_failures,
             extracted_document_data=extraction_result.extracted_documents,
         )
@@ -272,7 +373,13 @@ def process_claim(submission: ClaimSubmission, policy: PolicyTerms | None = None
             evidence,
             ["ANNUAL_OPD_LIMIT_EXCEEDED"],
             annual_limit_reason,
-            confidence=0.92,
+            confidence=_confidence_score(
+                submission,
+                evidence,
+                extraction_result.extracted_documents,
+                component_failures,
+                rule_certainty_impact=-0.06,
+            ),
             component_failures=component_failures,
             extracted_document_data=extraction_result.extracted_documents,
         )
@@ -289,6 +396,21 @@ def process_claim(submission: ClaimSubmission, policy: PolicyTerms | None = None
                 "approved_amount": decision.approved_amount,
                 "confidence_score": decision.confidence_score,
             },
+            checks_performed=[
+                "member_validity",
+                "policy_validity",
+                "submission_deadline",
+                "minimum_claim_amount",
+                "category_coverage",
+                "exclusions",
+                "waiting_periods",
+                "pre_authorization",
+                "fraud_thresholds",
+                "per_claim_limit",
+                "annual_opd_limit",
+                "amount_calculation",
+            ],
+            evidence_ids=[item.evidence_id for item in evidence],
         )
     )
     return _completed_response(
@@ -362,7 +484,13 @@ def _validate_documents(
         TraceEvent(
             component="DocumentClassifier",
             message="Documents classified for early intake validation.",
+            input_summary={
+                "required_document_types": requirement.required,
+                "uploaded_file_ids": [doc.file_id for doc in submission.documents],
+            },
             output_summary={"classifications": classification_summary},
+            checks_performed=["document_classification", "document_quality_available"],
+            evidence_ids=[item.evidence_id for item in evidence if item.rule_category == "document_requirements"],
         )
     )
 
@@ -377,6 +505,9 @@ def _validate_documents(
                 level=TraceLevel.WARNING,
                 message=message,
                 output_summary={"affected_file_ids": [doc.file_id for doc in unreadable]},
+                checks_performed=["readability_check"],
+                confidence_impact=-0.35,
+                warnings=[message],
             )
         )
         return ClaimResponse(
@@ -405,6 +536,9 @@ def _validate_documents(
                 level=TraceLevel.WARNING,
                 message=message,
                 output_summary={"affected_file_ids": [item.document.file_id for item in unknown]},
+                checks_performed=["supported_document_type_check"],
+                confidence_impact=-0.25,
+                warnings=[message],
             )
         )
         return ClaimResponse(
@@ -434,6 +568,10 @@ def _validate_documents(
                 level=TraceLevel.WARNING,
                 message=message,
                 output_summary={"missing_document_types": missing, "uploaded_document_types": uploaded_types},
+                checks_performed=["required_document_check"],
+                evidence_ids=[item.evidence_id for item in evidence if item.rule_category == "document_requirements"],
+                confidence_impact=-0.2,
+                warnings=[message],
             )
         )
         return ClaimResponse(
@@ -475,6 +613,9 @@ def _validate_documents(
                 level=TraceLevel.WARNING,
                 message=message,
                 output_summary={"patient_names": names, "affected_file_ids": affected_file_ids},
+                checks_performed=["patient_consistency_check"],
+                confidence_impact=-0.25,
+                warnings=[message],
             )
         )
         return ClaimResponse(
@@ -494,7 +635,15 @@ def _validate_documents(
         TraceEvent(
             component="DocumentVerifierAgent",
             message="Required documents are present, readable, and patient names are consistent.",
+            input_summary={"required_document_types": requirement.required},
             output_summary={"document_types": uploaded_types},
+            checks_performed=[
+                "required_document_check",
+                "readability_check",
+                "supported_document_type_check",
+                "patient_consistency_check",
+            ],
+            evidence_ids=[item.evidence_id for item in evidence if item.rule_category == "document_requirements"],
         )
     )
     return None
@@ -588,7 +737,7 @@ def _rejected(
     reason: str,
     confidence: float,
     component_failures: list[ComponentFailure] | None = None,
-    extracted_document_data: list[Any] | None = None,
+    extracted_document_data: list[ExtractedDocumentData] | None = None,
 ) -> ClaimResponse:
     decision = ClaimDecision(
         decision=ClaimDecisionType.REJECTED,
@@ -603,6 +752,10 @@ def _rejected(
             level=TraceLevel.WARNING,
             message=reason,
             output_summary={"rejection_reasons": rejection_reasons},
+            checks_performed=_rule_checks_for_rejection(rejection_reasons),
+            evidence_ids=[item.evidence_id for item in evidence],
+            confidence_impact=round(confidence - 0.97, 4),
+            warnings=[reason],
         )
     )
     return _completed_response(
@@ -621,8 +774,18 @@ def _completed_response(
     trace: list[TraceEvent],
     evidence: list[PolicyEvidence],
     component_failures: list[ComponentFailure],
-    extracted_document_data: list[Any] | None = None,
+    extracted_document_data: list[ExtractedDocumentData] | None = None,
 ) -> ClaimResponse:
+    extracted_documents = extracted_document_data or []
+    trace.extend(
+        _final_explainability_trace(
+            submission,
+            decision,
+            evidence,
+            component_failures,
+            extracted_documents,
+        )
+    )
     return ClaimResponse(
         status=ClaimStatus.COMPLETED,
         submission=submission,
@@ -632,11 +795,224 @@ def _completed_response(
         reason=decision.reason,
         rejection_reasons=decision.rejection_reasons,
         line_item_decisions=decision.line_item_decisions,
-        extracted_document_data=extracted_document_data or [],
+        extracted_document_data=extracted_documents,
         trace=trace,
         retrieved_policy_evidence=evidence,
         component_failures=component_failures,
     )
+
+
+def _final_explainability_trace(
+    submission: ClaimSubmission,
+    decision: ClaimDecision,
+    evidence: list[PolicyEvidence],
+    component_failures: list[ComponentFailure],
+    extracted_documents: list[ExtractedDocumentData],
+) -> list[TraceEvent]:
+    confidence_inputs = _confidence_inputs(
+        submission,
+        evidence,
+        extracted_documents,
+        component_failures,
+    )
+    amount_calculation = _amount_calculation_summary(submission, decision)
+    evidence_ids = [item.evidence_id for item in evidence]
+    return [
+        TraceEvent(
+            component="ConfidenceScorer",
+            message="Final confidence score computed from document, extraction, policy, rule, and component signals.",
+            input_summary=confidence_inputs,
+            output_summary={
+                "confidence_score": decision.confidence_score,
+                "decision": decision.decision,
+            },
+            checks_performed=[
+                "document_quality",
+                "extraction_completeness",
+                "patient_consistency",
+                "policy_evidence_strength",
+                "rule_certainty",
+                "component_failures",
+            ],
+            evidence_ids=evidence_ids,
+            confidence_impact=round(decision.confidence_score - 0.97, 4),
+            warnings=[failure.message for failure in component_failures],
+        ),
+        TraceEvent(
+            component="DecisionExplainer",
+            message="Decision explanation assembled for review.",
+            input_summary={
+                "documents_checked": _document_check_summary(submission),
+                "extracted_fields": _extracted_field_summary(extracted_documents),
+                "policy_rules_applied": _policy_rule_summary(evidence),
+            },
+            output_summary={
+                "decision": decision.decision,
+                "approved_amount": decision.approved_amount,
+                "rejection_reasons": decision.rejection_reasons,
+                "line_item_decisions": [
+                    item.model_dump(mode="json") for item in decision.line_item_decisions
+                ],
+                "amount_calculation": amount_calculation,
+                "reason": decision.reason,
+            },
+            checks_performed=[
+                "documents_checked_summary",
+                "fields_extracted_summary",
+                "policy_rules_applied_summary",
+                "passed_failed_rule_summary",
+                "approved_amount_calculation_summary",
+                "confidence_change_summary",
+            ],
+            evidence_ids=evidence_ids,
+            warnings=[failure.message for failure in component_failures],
+        ),
+    ]
+
+
+def _confidence_score(
+    submission: ClaimSubmission,
+    evidence: list[PolicyEvidence],
+    extracted_documents: list[ExtractedDocumentData],
+    component_failures: list[ComponentFailure] | None = None,
+    *,
+    rule_certainty_impact: float = 0,
+) -> float:
+    inputs = _confidence_inputs(submission, evidence, extracted_documents, component_failures or [])
+    score = 0.97
+    score += inputs["document_quality_impact"]
+    score += inputs["extraction_completeness_impact"]
+    score += inputs["policy_evidence_impact"]
+    score += rule_certainty_impact
+    score += inputs["component_failure_impact"]
+    return round(max(0.5, min(0.99, score)), 2)
+
+
+def _confidence_inputs(
+    submission: ClaimSubmission,
+    evidence: list[PolicyEvidence],
+    extracted_documents: list[ExtractedDocumentData],
+    component_failures: list[ComponentFailure],
+) -> dict[str, Any]:
+    qualities = [document.quality for document in submission.documents]
+    low_quality_count = sum(1 for quality in qualities if quality == DocumentQuality.LOW)
+    unknown_quality_count = sum(1 for quality in qualities if quality == DocumentQuality.UNKNOWN)
+    unreadable_count = sum(1 for quality in qualities if quality == DocumentQuality.UNREADABLE)
+    missing_field_count = sum(len(item.missing_fields) for item in extracted_documents)
+    average_extraction_confidence = (
+        sum(item.confidence for item in extracted_documents) / len(extracted_documents)
+        if extracted_documents
+        else 0
+    )
+    evidence_strength = (
+        max((item.rrf_score or item.dense_score or item.lexical_score or 0) for item in evidence)
+        if evidence
+        else 0
+    )
+
+    document_quality_impact = (
+        -0.35 * unreadable_count
+        - 0.05 * low_quality_count
+        - 0.02 * unknown_quality_count
+    )
+    extraction_completeness_impact = 0.0
+    if extracted_documents:
+        extraction_completeness_impact -= min(0.14, 0.025 * missing_field_count)
+        extraction_completeness_impact -= max(0.0, 0.9 - average_extraction_confidence) * 0.2
+    policy_evidence_impact = 0.0 if evidence_strength >= 0.02 else -0.04
+    component_failure_impact = -0.08 * len(component_failures)
+
+    return {
+        "document_quality": [str(quality) for quality in qualities],
+        "document_quality_impact": round(document_quality_impact, 4),
+        "extracted_document_count": len(extracted_documents),
+        "missing_field_count": missing_field_count,
+        "average_extraction_confidence": round(average_extraction_confidence, 4),
+        "extraction_completeness_impact": round(extraction_completeness_impact, 4),
+        "patient_consistency": "passed",
+        "policy_evidence_count": len(evidence),
+        "strongest_policy_evidence_score": round(evidence_strength, 6),
+        "policy_evidence_impact": round(policy_evidence_impact, 4),
+        "component_failure_count": len(component_failures),
+        "component_failure_impact": round(component_failure_impact, 4),
+    }
+
+
+def _document_check_summary(submission: ClaimSubmission) -> list[dict[str, Any]]:
+    return [
+        {
+            "file_id": document.file_id,
+            "file_name": document.file_name,
+            "declared_type": document.declared_type,
+            "actual_type": document.actual_type,
+            "quality": document.quality,
+        }
+        for document in submission.documents
+    ]
+
+
+def _extracted_field_summary(extracted_documents: list[ExtractedDocumentData]) -> list[dict[str, Any]]:
+    return [
+        {
+            "file_id": item.file_id,
+            "document_type": item.document_type,
+            "fields": sorted(item.fields),
+            "missing_fields": item.missing_fields,
+            "confidence": item.confidence,
+            "warnings": item.warnings,
+        }
+        for item in extracted_documents
+    ]
+
+
+def _policy_rule_summary(evidence: list[PolicyEvidence]) -> list[dict[str, Any]]:
+    return [
+        {
+            "evidence_id": item.evidence_id,
+            "rule_category": item.rule_category,
+            "source_path": item.source_path,
+            "rrf_score": item.rrf_score,
+        }
+        for item in evidence
+    ]
+
+
+def _amount_calculation_summary(submission: ClaimSubmission, decision: ClaimDecision) -> dict[str, Any]:
+    return {
+        "claimed_amount": submission.claimed_amount,
+        "approved_amount": decision.approved_amount,
+        "line_items": [
+            {
+                "description": item.description,
+                "claimed_amount": item.claimed_amount,
+                "approved_amount": item.approved_amount,
+                "decision": item.decision,
+                "reason": item.reason,
+            }
+            for item in decision.line_item_decisions
+        ],
+    }
+
+
+def _rule_checks_for_rejection(rejection_reasons: list[str]) -> list[str]:
+    checks_by_reason = {
+        "POLICY_MISMATCH": ["policy_id_matches_active_policy"],
+        "MEMBER_NOT_FOUND": ["member_validity"],
+        "POLICY_NOT_ACTIVE": ["policy_validity"],
+        "SUBMISSION_RULE_FAILED": ["submission_deadline", "minimum_claim_amount"],
+        "CATEGORY_NOT_COVERED": ["category_coverage"],
+        "EXCLUDED_CONDITION": ["policy_exclusions"],
+        "EXCLUDED_VISION_ITEM": ["vision_exclusions"],
+        "WAITING_PERIOD": ["waiting_periods"],
+        "PRE_AUTH_MISSING": ["pre_authorization"],
+        "PER_CLAIM_EXCEEDED": ["per_claim_limit"],
+        "ANNUAL_OPD_LIMIT_EXCEEDED": ["annual_opd_limit"],
+        "EXCLUDED_DENTAL_PROCEDURE": ["dental_excluded_procedures"],
+    }
+    checks: list[str] = []
+    for reason in rejection_reasons:
+        checks.extend(checks_by_reason.get(reason, ["deterministic_rule_check"]))
+    return checks
 
 
 def _member_for(member_id: str, policy: PolicyTerms) -> PolicyMember | None:
