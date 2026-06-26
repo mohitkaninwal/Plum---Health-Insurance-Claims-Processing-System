@@ -29,6 +29,7 @@ from app.models.policy import PolicyMember, PolicyTerms
 from app.services.document_intake import classify_document
 from app.services.extraction_pipeline import run_extraction_pipeline
 from app.services.policy_loader import read_policy_terms
+from app.services.policy_retriever import retrieve_policy_evidence
 
 TEST_CASES_PATH = Path(__file__).resolve().parents[3] / "test_cases.json"
 
@@ -659,6 +660,10 @@ def _hospital_name(submission: ClaimSubmission) -> str | None:
 
 
 def _policy_evidence(submission: ClaimSubmission, policy: PolicyTerms) -> list[PolicyEvidence]:
+    evidence = retrieve_policy_evidence(submission, policy)
+    if evidence:
+        return evidence
+
     return [
         PolicyEvidence(
             evidence_id="POLICY_DOCUMENT_REQUIREMENTS",

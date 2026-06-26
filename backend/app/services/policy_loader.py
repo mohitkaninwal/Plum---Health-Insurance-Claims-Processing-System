@@ -15,12 +15,14 @@ from app.db.models import (
     MemberRecord,
     NetworkHospitalRecord,
     OpdCategoryRecord,
+    PolicyKnowledgeChunkRecord,
     PolicyRecord,
     PreAuthorizationRuleRecord,
     WaitingPeriodRecord,
 )
 from app.db.session import SessionLocal
 from app.models.policy import PolicyTerms
+from app.services.policy_retriever import index_policy_knowledge
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +51,7 @@ def load_policy_terms(path: Path = POLICY_TERMS_PATH) -> PolicyTerms:
     db = SessionLocal()
     try:
         upsert_policy_terms(db, policy)
+        index_policy_knowledge(db, policy)
         db.commit()
     except SQLAlchemyError as exc:
         db.rollback()
@@ -68,6 +71,7 @@ def load_policy_terms_on_startup() -> PolicyTerms:
         db = SessionLocal()
         try:
             upsert_policy_terms(db, policy)
+            index_policy_knowledge(db, policy)
             db.commit()
         except SQLAlchemyError as exc:
             db.rollback()
@@ -226,6 +230,7 @@ def _delete_policy_children(db: Session, policy_id: str) -> None:
         PreAuthorizationRuleRecord,
         FraudThresholdRecord,
         NetworkHospitalRecord,
+        PolicyKnowledgeChunkRecord,
         MemberRecord,
     ):
         db.execute(delete(table).where(table.policy_id == policy_id))

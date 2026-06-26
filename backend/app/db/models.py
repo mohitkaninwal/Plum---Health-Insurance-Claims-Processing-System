@@ -4,6 +4,7 @@ from typing import Any
 from sqlalchemy import Date, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship as orm_relationship
+from pgvector.sqlalchemy import Vector
 
 from app.db.base import Base
 
@@ -139,6 +140,27 @@ class NetworkHospitalRecord(Base):
 
     __table_args__ = (
         UniqueConstraint("policy_id", "hospital_name", name="uq_network_hospitals_policy_name"),
+    )
+
+
+class PolicyKnowledgeChunkRecord(Base):
+    __tablename__ = "policy_knowledge_chunks"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    policy_id: Mapped[str] = mapped_column(ForeignKey("policies.policy_id", ondelete="CASCADE"))
+    evidence_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    source: Mapped[str] = mapped_column(String(255), nullable=False)
+    source_path: Mapped[str] = mapped_column(String(512), nullable=False)
+    rule_category: Mapped[str] = mapped_column(String(128), nullable=False)
+    claim_category: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+    keywords: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+    embedding: Mapped[list[float]] = mapped_column(Vector(64), nullable=False)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("policy_id", "evidence_id", name="uq_policy_knowledge_policy_evidence"),
     )
 
 
