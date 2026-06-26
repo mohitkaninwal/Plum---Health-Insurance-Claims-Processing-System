@@ -4,13 +4,43 @@
 
 :root {
   color-scheme: light;
-  background: #f7f8fa;
-  color: #17202a;
+  --bg: #f6efe6;
+  --panel: #fffaf2;
+  --ink: #1d0716;
+  --plum: #1d0716;
+  --muted: #64515c;
+  --line: rgba(29, 7, 22, 0.12);
+  background: var(--bg);
+  color: var(--ink);
+  font-family: Inter, "Segoe UI", system-ui, -apple-system, sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  scroll-behavior: smooth;
 }
 
 body {
   margin: 0;
-  background: #f7f8fa;
+  background:
+    radial-gradient(circle at top left, rgba(255, 188, 159, 0.28), transparent 24%),
+    radial-gradient(circle at top right, rgba(255, 241, 229, 0.6), transparent 28%),
+    linear-gradient(180deg, #f8f2ea 0%, #f4ebe1 100%);
+  color: var(--ink);
+}
+
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  background-image: linear-gradient(rgba(29, 7, 22, 0.03) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(29, 7, 22, 0.03) 1px, transparent 1px);
+  background-size: 32px 32px;
+  mask-image: linear-gradient(180deg, rgba(0, 0, 0, 0.28), transparent 80%);
 }
 
 button,
@@ -20,3 +50,32 @@ textarea {
   font: inherit;
 }
 
+input,
+select,
+textarea {
+  background: #fff;
+  border: 1px solid rgba(29, 7, 22, 0.14);
+  border-radius: 14px;
+  color: var(--ink);
+  padding: 0.8rem 0.95rem;
+  outline: none;
+  transition:
+    border-color 140ms ease,
+    box-shadow 140ms ease,
+    background-color 140ms ease;
+}
+
+input:focus,
+select:focus,
+textarea:focus {
+  border-color: rgba(29, 7, 22, 0.35);
+  box-shadow: 0 0 0 4px rgba(255, 177, 136, 0.18);
+}
+
+.field {
+  width: 100%;
+}
+
+::selection {
+  background: rgba(29, 7, 22, 0.14);
+}

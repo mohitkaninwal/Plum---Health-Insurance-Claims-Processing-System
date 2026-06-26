@@ -3,7 +3,8 @@ import "./globals.css";
 
 export const metadata: Metadata = {
   title: "Plum Claims Ops",
-  description: "Explainable health insurance claims processing review UI"
+  description: "Explainable health insurance claims processing review UI",
+  metadataBase: new URL("http://localhost:3000")
 };
 
 export default function RootLayout({
@@ -17,4 +18,3 @@ export default function RootLayout({
     </html>
   );
 }
-
