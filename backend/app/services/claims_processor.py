@@ -108,6 +108,45 @@ def process_claim(submission: ClaimSubmission, policy: PolicyTerms | None = None
             extracted_document_data=extraction_result.extracted_documents,
         )
 
+    policy_validity_reason = _policy_validity_reason(submission, policy)
+    if policy_validity_reason:
+        return _rejected(
+            submission,
+            trace,
+            evidence,
+            ["POLICY_NOT_ACTIVE"],
+            policy_validity_reason,
+            confidence=0.98,
+            component_failures=extraction_result.component_failures,
+            extracted_document_data=extraction_result.extracted_documents,
+        )
+
+    submission_rules_reason = _submission_rules_reason(submission, policy)
+    if submission_rules_reason:
+        return _rejected(
+            submission,
+            trace,
+            evidence,
+            ["SUBMISSION_RULE_FAILED"],
+            submission_rules_reason,
+            confidence=0.96,
+            component_failures=extraction_result.component_failures,
+            extracted_document_data=extraction_result.extracted_documents,
+        )
+
+    category_reason = _category_coverage_reason(submission, policy)
+    if category_reason:
+        return _rejected(
+            submission,
+            trace,
+            evidence,
+            ["CATEGORY_NOT_COVERED"],
+            category_reason,
+            confidence=0.96,
+            component_failures=extraction_result.component_failures,
+            extracted_document_data=extraction_result.extracted_documents,
+        )
+
     component_failures: list[ComponentFailure] = list(extraction_result.component_failures)
     confidence = max(0.5, min(0.99, 0.93 + extraction_result.confidence_impact))
     if submission.simulate_component_failure:
@@ -137,6 +176,19 @@ def process_claim(submission: ClaimSubmission, policy: PolicyTerms | None = None
             evidence,
             ["EXCLUDED_CONDITION"],
             exclusion_reason,
+            confidence=0.94,
+            component_failures=component_failures,
+            extracted_document_data=extraction_result.extracted_documents,
+        )
+
+    vision_exclusion_reason = _vision_exclusion_reason(submission, text, policy)
+    if vision_exclusion_reason:
+        return _rejected(
+            submission,
+            trace,
+            evidence,
+            ["EXCLUDED_VISION_ITEM"],
+            vision_exclusion_reason,
             confidence=0.94,
             component_failures=component_failures,
             extracted_document_data=extraction_result.extracted_documents,
@@ -207,6 +259,19 @@ def process_claim(submission: ClaimSubmission, policy: PolicyTerms | None = None
                 f"Claimed amount INR {submission.claimed_amount:.0f} exceeds the per-claim "
                 f"limit of INR {policy.coverage.per_claim_limit:.0f}."
             ),
+            confidence=0.92,
+            component_failures=component_failures,
+            extracted_document_data=extraction_result.extracted_documents,
+        )
+
+    annual_limit_reason = _annual_limit_reason(submission, policy)
+    if annual_limit_reason:
+        return _rejected(
+            submission,
+            trace,
+            evidence,
+            ["ANNUAL_OPD_LIMIT_EXCEEDED"],
+            annual_limit_reason,
             confidence=0.92,
             component_failures=component_failures,
             extracted_document_data=extraction_result.extracted_documents,
@@ -471,11 +536,15 @@ def _approve_or_partially_approve(
                     )
                 )
         decision_type = ClaimDecisionType.PARTIAL if approved_amount < submission.claimed_amount else ClaimDecisionType.APPROVED
+        rejection_reasons = ["EXCLUDED_DENTAL_PROCEDURE"] if approved_amount == 0 else []
+        if approved_amount == 0:
+            decision_type = ClaimDecisionType.REJECTED
         return ClaimDecision(
             decision=decision_type,
             approved_amount=approved_amount,
             confidence_score=confidence,
             reason="Covered dental items were approved and excluded cosmetic items were rejected.",
+            rejection_reasons=rejection_reasons,
             line_item_decisions=decisions,
         )
 
@@ -574,6 +643,73 @@ def _member_for(member_id: str, policy: PolicyTerms) -> PolicyMember | None:
     return next((member for member in policy.members if member.member_id == member_id), None)
 
 
+def _policy_validity_reason(submission: ClaimSubmission, policy: PolicyTerms) -> str | None:
+    holder = policy.policy_holder
+    if holder.renewal_status.upper() != "ACTIVE":
+        return f"Policy {policy.policy_id} is not active; renewal status is {holder.renewal_status}."
+    if submission.treatment_date < holder.policy_start_date:
+        return (
+            f"Treatment date {submission.treatment_date.isoformat()} is before policy start date "
+            f"{holder.policy_start_date.isoformat()}."
+        )
+    if submission.treatment_date > holder.policy_end_date:
+        return (
+            f"Treatment date {submission.treatment_date.isoformat()} is after policy end date "
+            f"{holder.policy_end_date.isoformat()}."
+        )
+    return None
+
+
+def _submission_rules_reason(submission: ClaimSubmission, policy: PolicyTerms) -> str | None:
+    if submission.claimed_amount < policy.submission_rules.minimum_claim_amount:
+        return (
+            f"Claimed amount {policy.submission_rules.currency} {submission.claimed_amount:.0f} is below "
+            f"the minimum claim amount of {policy.submission_rules.currency} "
+            f"{policy.submission_rules.minimum_claim_amount:.0f}."
+        )
+
+    submitted_on = _submitted_on(submission)
+    days_after_treatment = (submitted_on - submission.treatment_date).days
+    if days_after_treatment > policy.submission_rules.deadline_days_from_treatment:
+        return (
+            f"Claim was submitted {days_after_treatment} days after treatment; policy allows "
+            f"{policy.submission_rules.deadline_days_from_treatment} days from treatment."
+        )
+    return None
+
+
+def _submitted_on(submission: ClaimSubmission) -> date:
+    for doc in submission.documents:
+        content = doc.content or {}
+        raw_date = content.get("submitted_on") or content.get("submission_date")
+        if isinstance(raw_date, date):
+            return raw_date
+        if isinstance(raw_date, str):
+            try:
+                return date.fromisoformat(raw_date)
+            except ValueError:
+                continue
+    return submission.treatment_date
+
+
+def _category_coverage_reason(submission: ClaimSubmission, policy: PolicyTerms) -> str | None:
+    config = policy.opd_categories[submission.claim_category.lower()]
+    if not config.covered:
+        return f"{submission.claim_category} claims are not covered under policy {policy.policy_id}."
+    return None
+
+
+def _annual_limit_reason(submission: ClaimSubmission, policy: PolicyTerms) -> str | None:
+    ytd_claims = submission.ytd_claims_amount or 0
+    projected_total = ytd_claims + submission.claimed_amount
+    if projected_total > policy.coverage.annual_opd_limit:
+        return (
+            f"Projected annual OPD claims would be INR {projected_total:.0f}, exceeding the annual "
+            f"OPD limit of INR {policy.coverage.annual_opd_limit:.0f}."
+        )
+    return None
+
+
 def _claim_text(submission: ClaimSubmission) -> str:
     return json.dumps([doc.content or {} for doc in submission.documents], sort_keys=True).lower()
 
@@ -585,6 +721,19 @@ def _exclusion_reason(text: str, policy: PolicyTerms) -> str | None:
             return f"Treatment is excluded under policy exclusion: {term}."
         if normalized in text:
             return f"Treatment is excluded under policy exclusion: {term}."
+    return None
+
+
+def _vision_exclusion_reason(submission: ClaimSubmission, text: str, policy: PolicyTerms) -> str | None:
+    if submission.claim_category != "VISION":
+        return None
+    for term in policy.exclusions.vision_exclusions:
+        if term.lower() in text:
+            return f"Vision item is excluded under policy exclusion: {term}."
+    config = policy.opd_categories["vision"]
+    for item in config.excluded_items or []:
+        if item.lower() in text:
+            return f"Vision item is excluded under category rule: {item}."
     return None
 
 
