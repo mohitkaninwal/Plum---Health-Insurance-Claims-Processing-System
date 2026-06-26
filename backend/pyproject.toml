@@ -1,0 +1,36 @@
+[project]
+name = "plum-claims-backend"
+version = "0.1.0"
+description = "FastAPI backend for an explainable health insurance claims processing system."
+requires-python = ">=3.11"
+dependencies = [
+    "alembic>=1.13.2",
+    "fastapi>=0.115.0",
+    "groq>=0.11.0",
+    "langchain>=0.3.0",
+    "langgraph>=0.2.0",
+    "pgvector>=0.3.6",
+    "psycopg[binary]>=3.2.1",
+    "pydantic>=2.8.2",
+    "pydantic-settings>=2.4.0",
+    "python-multipart>=0.0.9",
+    "sqlalchemy>=2.0.32",
+    "uvicorn[standard]>=0.30.6"
+]
+
+[project.optional-dependencies]
+dev = [
+    "httpx>=0.27.0",
+    "pytest>=8.3.2",
+    "pytest-asyncio>=0.24.0",
+    "ruff>=0.6.2"
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
