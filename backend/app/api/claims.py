@@ -1,7 +1,11 @@
-from fastapi import APIRouter, HTTPException, Request, status
+from typing import Annotated
+
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 
 from app.models import ClaimResponse, ClaimSubmission
+from app.services.claim_intake_repository import persist_claim_intake
 from app.services.claims_processor import process_claim
+from app.services.document_intake import UploadDocumentForm, submission_from_upload_form
 
 router = APIRouter(prefix="/claims", tags=["claims"])
 
@@ -17,6 +21,24 @@ _CLAIMS: dict[str, ClaimResponse] = {}
 async def submit_claim(request: Request, submission: ClaimSubmission) -> ClaimResponse:
     policy = getattr(request.app.state, "policy_terms", None)
     response = process_claim(submission, policy=policy)
+    response = persist_claim_intake(response)
+    _CLAIMS[response.claim_id] = response
+    return response
+
+
+@router.post(
+    "/submit/upload",
+    response_model=ClaimResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Accept a claim submission with real uploaded documents",
+)
+async def submit_claim_upload(
+    request: Request, form: Annotated[UploadDocumentForm, Depends()]
+) -> ClaimResponse:
+    policy = getattr(request.app.state, "policy_terms", None)
+    submission = await submission_from_upload_form(form)
+    response = process_claim(submission, policy=policy)
+    response = persist_claim_intake(response)
     _CLAIMS[response.claim_id] = response
     return response
 

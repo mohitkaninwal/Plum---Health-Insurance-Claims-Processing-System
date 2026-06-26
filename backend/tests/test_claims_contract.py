@@ -38,7 +38,9 @@ def test_submit_claim_returns_standard_response_shape() -> None:
     assert payload["retrieved_policy_evidence"] != []
     assert payload["component_failures"] == []
     assert payload["trace"][0]["component"] == "ClaimIntakeAPI"
+    assert payload["trace"][1]["component"] == "DocumentClassifier"
     assert "HOSPITAL_BILL" in payload["reason"]
+    assert "only PRESCRIPTION documents were uploaded" in payload["reason"]
 
 
 def test_get_claim_returns_previously_submitted_claim() -> None:
@@ -213,3 +215,118 @@ def test_component_failure_is_visible_without_crashing() -> None:
     assert payload["decision"]["decision"] == "APPROVED"
     assert payload["component_failures"][0]["component"] == "PolicyEvidenceRetriever"
     assert payload["confidence_score"] < 0.85
+
+
+def test_submit_claim_stops_for_conflicting_patient_names() -> None:
+    client = TestClient(app)
+
+    response = client.post(
+        "/claims/submit",
+        json={
+            "member_id": "EMP001",
+            "policy_id": "PLUM_GHI_2024",
+            "claim_category": "CONSULTATION",
+            "treatment_date": "2024-11-01",
+            "claimed_amount": 1500,
+            "documents": [
+                {
+                    "file_id": "F005",
+                    "file_name": "prescription_rajesh.jpg",
+                    "actual_type": "PRESCRIPTION",
+                    "patient_name_on_doc": "Rajesh Kumar",
+                },
+                {
+                    "file_id": "F006",
+                    "file_name": "bill_arjun.jpg",
+                    "actual_type": "HOSPITAL_BILL",
+                    "patient_name_on_doc": "Arjun Mehta",
+                },
+            ],
+        },
+    )
+
+    payload = response.json()
+    assert payload["status"] == "ACTION_REQUIRED"
+    assert payload["decision"] is None
+    assert payload["member_action_required"]["code"] == "PATIENT_MISMATCH"
+    assert "Arjun Mehta" in payload["reason"]
+    assert "Rajesh Kumar" in payload["reason"]
+
+
+def test_submit_claim_stops_for_unknown_document_type() -> None:
+    client = TestClient(app)
+
+    response = client.post(
+        "/claims/submit",
+        json={
+            "member_id": "EMP001",
+            "policy_id": "PLUM_GHI_2024",
+            "claim_category": "CONSULTATION",
+            "treatment_date": "2024-11-01",
+            "claimed_amount": 1500,
+            "documents": [
+                {
+                    "file_id": "F099",
+                    "file_name": "random_attachment.jpg",
+                    "quality": "GOOD",
+                }
+            ],
+        },
+    )
+
+    payload = response.json()
+    assert payload["status"] == "ACTION_REQUIRED"
+    assert payload["member_action_required"]["code"] == "WRONG_DOCUMENT_TYPE"
+    assert "could not be classified" in payload["reason"]
+
+
+def test_submit_upload_classifies_files_with_backend_fallback() -> None:
+    client = TestClient(app)
+
+    response = client.post(
+        "/claims/submit/upload",
+        data={
+            "member_id": "EMP001",
+            "policy_id": "PLUM_GHI_2024",
+            "claim_category": "CONSULTATION",
+            "treatment_date": "2024-11-01",
+            "claimed_amount": "1500",
+        },
+        files=[
+            ("files", ("prescription.jpg", b"prescription bytes", "image/jpeg")),
+            ("files", ("hospital_bill.pdf", b"%PDF-1.4", "application/pdf")),
+        ],
+    )
+
+    payload = response.json()
+    assert response.status_code == 202
+    assert payload["status"] == "COMPLETED"
+    assert payload["decision"]["decision"] == "APPROVED"
+    classifications = payload["trace"][1]["output_summary"]["classifications"]
+    assert {item["document_type"] for item in classifications} == {"PRESCRIPTION", "HOSPITAL_BILL"}
+
+
+def test_submit_upload_stops_for_unreadable_file() -> None:
+    client = TestClient(app)
+
+    response = client.post(
+        "/claims/submit/upload",
+        data={
+            "member_id": "EMP004",
+            "policy_id": "PLUM_GHI_2024",
+            "claim_category": "PHARMACY",
+            "treatment_date": "2024-10-25",
+            "claimed_amount": "800",
+        },
+        files=[
+            ("files", ("prescription.jpg", b"prescription bytes", "image/jpeg")),
+            ("files", ("blurry_bill.jpg", b"", "image/jpeg")),
+        ],
+    )
+
+    payload = response.json()
+    assert response.status_code == 202
+    assert payload["status"] == "ACTION_REQUIRED"
+    assert payload["decision"] is None
+    assert payload["member_action_required"]["code"] == "UNREADABLE_DOCUMENT"
+    assert "blurry_bill.jpg" in payload["reason"]

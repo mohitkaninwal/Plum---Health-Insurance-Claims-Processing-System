@@ -140,3 +140,68 @@ class NetworkHospitalRecord(Base):
     __table_args__ = (
         UniqueConstraint("policy_id", "hospital_name", name="uq_network_hospitals_policy_name"),
     )
+
+
+class ClaimIntakeRecord(Base):
+    __tablename__ = "claim_intakes"
+
+    claim_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    member_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    policy_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    claim_category: Mapped[str] = mapped_column(String(64), nullable=False)
+    treatment_date: Mapped[date] = mapped_column(Date, nullable=False)
+    claimed_amount: Mapped[float] = mapped_column(Float, nullable=False)
+    ytd_claims_amount: Mapped[float | None] = mapped_column(Float, nullable=True)
+    hospital_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    status: Mapped[str] = mapped_column(String(64), nullable=False)
+    decision: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    approved_amount: Mapped[float | None] = mapped_column(Float, nullable=True)
+    confidence_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    validation_status: Mapped[str] = mapped_column(String(64), nullable=False)
+    member_action_code: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    rejection_reasons: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+    trace: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False, default=list)
+    component_failures: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False, default=list)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=utc_now,
+        onupdate=utc_now,
+        nullable=False,
+    )
+
+    documents: Mapped[list["UploadedDocumentRecord"]] = orm_relationship(
+        back_populates="claim",
+        cascade="all, delete-orphan",
+    )
+
+
+class UploadedDocumentRecord(Base):
+    __tablename__ = "uploaded_documents"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    claim_id: Mapped[str] = mapped_column(
+        ForeignKey("claim_intakes.claim_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    file_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    file_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    mime_type: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    size_bytes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    storage_uri: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    declared_type: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    classified_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    classification_confidence: Mapped[float] = mapped_column(Float, nullable=False)
+    classification_source: Mapped[str] = mapped_column(String(64), nullable=False)
+    quality: Mapped[str] = mapped_column(String(64), nullable=False)
+    patient_name_on_doc: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    validation_status: Mapped[str] = mapped_column(String(64), nullable=False)
+    validation_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+    claim: Mapped[ClaimIntakeRecord] = orm_relationship(back_populates="documents")
+
+    __table_args__ = (UniqueConstraint("claim_id", "file_id", name="uq_uploaded_documents_claim_file"),)

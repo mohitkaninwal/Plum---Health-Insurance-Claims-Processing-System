@@ -26,6 +26,7 @@ from app.models import (
     TraceLevel,
 )
 from app.models.policy import PolicyMember, PolicyTerms
+from app.services.document_intake import classify_document
 from app.services.policy_loader import read_policy_terms
 
 TEST_CASES_PATH = Path(__file__).resolve().parents[3] / "test_cases.json"
@@ -242,14 +243,87 @@ def _validate_documents(
     evidence: list[PolicyEvidence],
 ) -> ClaimResponse | None:
     requirement = policy.document_requirements[submission.claim_category]
-    uploaded_types = [doc.actual_type or doc.declared_type or DocumentType.UNKNOWN for doc in submission.documents]
+    classifications = [classify_document(doc) for doc in submission.documents]
+    uploaded_types = [item.classification.document_type for item in classifications]
+    classification_summary = [
+        {
+            "file_id": item.document.file_id,
+            "file_name": item.document.file_name,
+            "document_type": item.classification.document_type,
+            "confidence": item.classification.confidence,
+            "source": item.source,
+        }
+        for item in classifications
+    ]
+    trace.append(
+        TraceEvent(
+            component="DocumentClassifier",
+            message="Documents classified for early intake validation.",
+            output_summary={"classifications": classification_summary},
+        )
+    )
+
+    unreadable = [item.document for item in classifications if item.document.quality == DocumentQuality.UNREADABLE]
+    if unreadable:
+        names = ", ".join(doc.file_name or doc.file_id for doc in unreadable)
+        noun = "document" if len(unreadable) == 1 else "documents"
+        message = f"The uploaded {noun} {names} is unreadable. Please re-upload a clearer image or PDF."
+        trace.append(
+            TraceEvent(
+                component="DocumentVerifierAgent",
+                level=TraceLevel.WARNING,
+                message=message,
+                output_summary={"affected_file_ids": [doc.file_id for doc in unreadable]},
+            )
+        )
+        return ClaimResponse(
+            status=ClaimStatus.ACTION_REQUIRED,
+            submission=submission,
+            reason=message,
+            member_action_required=MemberActionRequired(
+                code="UNREADABLE_DOCUMENT",
+                message=message,
+                affected_file_ids=[doc.file_id for doc in unreadable],
+            ),
+            trace=trace,
+            retrieved_policy_evidence=evidence,
+        )
+
+    unknown = [item for item in classifications if item.classification.document_type == DocumentType.UNKNOWN]
+    if unknown:
+        names = ", ".join(item.document.file_name or item.document.file_id for item in unknown)
+        message = (
+            f"The uploaded document {names} could not be classified as a supported claim document. "
+            "Please upload a clearer prescription, bill, report, or discharge summary."
+        )
+        trace.append(
+            TraceEvent(
+                component="DocumentVerifierAgent",
+                level=TraceLevel.WARNING,
+                message=message,
+                output_summary={"affected_file_ids": [item.document.file_id for item in unknown]},
+            )
+        )
+        return ClaimResponse(
+            status=ClaimStatus.ACTION_REQUIRED,
+            submission=submission,
+            reason=message,
+            member_action_required=MemberActionRequired(
+                code="WRONG_DOCUMENT_TYPE",
+                message=message,
+                affected_file_ids=[item.document.file_id for item in unknown],
+            ),
+            trace=trace,
+            retrieved_policy_evidence=evidence,
+        )
+
     missing = [doc_type for doc_type in requirement.required if doc_type not in uploaded_types]
     if missing:
         uploaded_text = ", ".join(sorted({str(doc_type) for doc_type in uploaded_types}))
         missing_text = ", ".join(str(doc_type) for doc_type in missing)
         message = (
-            f"{submission.claim_category} requires {missing_text}, but uploaded documents were "
-            f"classified as {uploaded_text}. Please upload {missing_text}."
+            f"{submission.claim_category} requires {missing_text}, but only {uploaded_text} "
+            f"documents were uploaded. Please upload {missing_text}."
         )
         trace.append(
             TraceEvent(
@@ -272,47 +346,32 @@ def _validate_documents(
             retrieved_policy_evidence=evidence,
         )
 
-    unreadable = [doc for doc in submission.documents if doc.quality == DocumentQuality.UNREADABLE]
-    if unreadable:
-        names = ", ".join(doc.file_name or doc.file_id for doc in unreadable)
-        message = f"The uploaded document {names} is unreadable. Please re-upload a clearer image or PDF."
-        trace.append(
-            TraceEvent(
-                component="DocumentVerifierAgent",
-                level=TraceLevel.WARNING,
-                message=message,
-                output_summary={"affected_file_ids": [doc.file_id for doc in unreadable]},
-            )
-        )
-        return ClaimResponse(
-            status=ClaimStatus.ACTION_REQUIRED,
-            submission=submission,
-            reason=message,
-            member_action_required=MemberActionRequired(
-                code="UNREADABLE_DOCUMENT",
-                message=message,
-                affected_file_ids=[doc.file_id for doc in unreadable],
-            ),
-            trace=trace,
-            retrieved_policy_evidence=evidence,
-        )
+    patient_names_by_key: dict[str, list[str]] = {}
+    patient_display_names: dict[str, str] = {}
+    for doc in submission.documents:
+        raw_name = doc.patient_name_on_doc or (doc.content or {}).get("patient_name")
+        if not raw_name:
+            continue
+        name = str(raw_name).strip()
+        key = re.sub(r"\s+", " ", name).casefold()
+        patient_names_by_key.setdefault(key, []).append(doc.file_id)
+        patient_display_names.setdefault(key, name)
 
-    patient_names = {
-        name
-        for doc in submission.documents
-        if (name := doc.patient_name_on_doc or (doc.content or {}).get("patient_name"))
-    }
-    if len(patient_names) > 1:
+    if len(patient_names_by_key) > 1:
+        names = [patient_display_names[key] for key in sorted(patient_names_by_key)]
+        affected_file_ids = [
+            file_id for key in sorted(patient_names_by_key) for file_id in patient_names_by_key[key]
+        ]
         message = (
             "Uploaded documents appear to belong to different patients: "
-            f"{', '.join(sorted(patient_names))}. Please upload documents for the same patient."
+            f"{', '.join(names)}. Please upload documents for the same patient."
         )
         trace.append(
             TraceEvent(
                 component="PatientConsistencyAgent",
                 level=TraceLevel.WARNING,
                 message=message,
-                output_summary={"patient_names": sorted(patient_names)},
+                output_summary={"patient_names": names, "affected_file_ids": affected_file_ids},
             )
         )
         return ClaimResponse(
@@ -322,7 +381,7 @@ def _validate_documents(
             member_action_required=MemberActionRequired(
                 code="PATIENT_MISMATCH",
                 message=message,
-                affected_file_ids=[doc.file_id for doc in submission.documents],
+                affected_file_ids=affected_file_ids,
             ),
             trace=trace,
             retrieved_policy_evidence=evidence,
