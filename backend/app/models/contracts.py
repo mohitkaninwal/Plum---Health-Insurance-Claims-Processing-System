@@ -191,6 +191,7 @@ class ClaimResponse(BaseModel):
     reason: str | None = None
     rejection_reasons: list[str] = Field(default_factory=list)
     line_item_decisions: list[LineItemDecision] = Field(default_factory=list)
+    extracted_document_data: list[ExtractedDocumentData] = Field(default_factory=list)
     member_action_required: MemberActionRequired | None = None
     trace: list[TraceEvent] = Field(default_factory=list)
     retrieved_policy_evidence: list[PolicyEvidence] = Field(default_factory=list)
@@ -226,4 +227,3 @@ class EvalRun(BaseModel):
     completed_at: datetime | None = None
     metrics: EvalMetrics = Field(default_factory=EvalMetrics)
     cases: list[EvalCaseResult] = Field(default_factory=list)
-

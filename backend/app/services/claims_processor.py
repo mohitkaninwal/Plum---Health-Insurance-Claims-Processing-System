@@ -27,6 +27,7 @@ from app.models import (
 )
 from app.models.policy import PolicyMember, PolicyTerms
 from app.services.document_intake import classify_document
+from app.services.extraction_pipeline import run_extraction_pipeline
 from app.services.policy_loader import read_policy_terms
 
 TEST_CASES_PATH = Path(__file__).resolve().parents[3] / "test_cases.json"
@@ -77,6 +78,22 @@ def process_claim(submission: ClaimSubmission, policy: PolicyTerms | None = None
     if early_response is not None:
         return early_response
 
+    extraction_result = run_extraction_pipeline(submission)
+    submission = extraction_result.submission
+    trace.extend(extraction_result.trace)
+    if extraction_result.member_action_required is not None:
+        message = extraction_result.member_action_required.message
+        return ClaimResponse(
+            status=ClaimStatus.ACTION_REQUIRED,
+            submission=submission,
+            reason=message,
+            member_action_required=extraction_result.member_action_required,
+            trace=trace,
+            retrieved_policy_evidence=evidence,
+            component_failures=extraction_result.component_failures,
+            extracted_document_data=extraction_result.extracted_documents,
+        )
+
     member = _member_for(submission.member_id, policy)
     if member is None:
         return _rejected(
@@ -86,10 +103,12 @@ def process_claim(submission: ClaimSubmission, policy: PolicyTerms | None = None
             ["MEMBER_NOT_FOUND"],
             f"Member {submission.member_id} is not listed under policy {policy.policy_id}.",
             confidence=0.98,
+            component_failures=extraction_result.component_failures,
+            extracted_document_data=extraction_result.extracted_documents,
         )
 
-    component_failures: list[ComponentFailure] = []
-    confidence = 0.93
+    component_failures: list[ComponentFailure] = list(extraction_result.component_failures)
+    confidence = max(0.5, min(0.99, 0.93 + extraction_result.confidence_impact))
     if submission.simulate_component_failure:
         component_failures.append(
             ComponentFailure(
@@ -119,6 +138,7 @@ def process_claim(submission: ClaimSubmission, policy: PolicyTerms | None = None
             exclusion_reason,
             confidence=0.94,
             component_failures=component_failures,
+            extracted_document_data=extraction_result.extracted_documents,
         )
 
     waiting_reason = _waiting_period_reason(submission, member, text, policy)
@@ -131,6 +151,7 @@ def process_claim(submission: ClaimSubmission, policy: PolicyTerms | None = None
             waiting_reason,
             confidence=0.91,
             component_failures=component_failures,
+            extracted_document_data=extraction_result.extracted_documents,
         )
 
     pre_auth_reason = _pre_auth_reason(submission, policy)
@@ -143,6 +164,7 @@ def process_claim(submission: ClaimSubmission, policy: PolicyTerms | None = None
             pre_auth_reason,
             confidence=0.9,
             component_failures=component_failures,
+            extracted_document_data=extraction_result.extracted_documents,
         )
 
     fraud_reason = _fraud_reason(submission, policy)
@@ -162,7 +184,14 @@ def process_claim(submission: ClaimSubmission, policy: PolicyTerms | None = None
                 confidence_impact=-0.08,
             )
         )
-        return _completed_response(submission, decision, trace, evidence, component_failures)
+        return _completed_response(
+            submission,
+            decision,
+            trace,
+            evidence,
+            component_failures,
+            extraction_result.extracted_documents,
+        )
 
     if (
         submission.claimed_amount > policy.coverage.per_claim_limit
@@ -179,6 +208,7 @@ def process_claim(submission: ClaimSubmission, policy: PolicyTerms | None = None
             ),
             confidence=0.92,
             component_failures=component_failures,
+            extracted_document_data=extraction_result.extracted_documents,
         )
 
     decision = _approve_or_partially_approve(submission, policy, confidence)
@@ -195,7 +225,14 @@ def process_claim(submission: ClaimSubmission, policy: PolicyTerms | None = None
             },
         )
     )
-    return _completed_response(submission, decision, trace, evidence, component_failures)
+    return _completed_response(
+        submission,
+        decision,
+        trace,
+        evidence,
+        component_failures,
+        extraction_result.extracted_documents,
+    )
 
 
 def run_test_case_eval(policy: PolicyTerms | None = None) -> EvalRun:
@@ -481,6 +518,7 @@ def _rejected(
     reason: str,
     confidence: float,
     component_failures: list[ComponentFailure] | None = None,
+    extracted_document_data: list[Any] | None = None,
 ) -> ClaimResponse:
     decision = ClaimDecision(
         decision=ClaimDecisionType.REJECTED,
@@ -497,7 +535,14 @@ def _rejected(
             output_summary={"rejection_reasons": rejection_reasons},
         )
     )
-    return _completed_response(submission, decision, trace, evidence, component_failures or [])
+    return _completed_response(
+        submission,
+        decision,
+        trace,
+        evidence,
+        component_failures or [],
+        extracted_document_data or [],
+    )
 
 
 def _completed_response(
@@ -506,6 +551,7 @@ def _completed_response(
     trace: list[TraceEvent],
     evidence: list[PolicyEvidence],
     component_failures: list[ComponentFailure],
+    extracted_document_data: list[Any] | None = None,
 ) -> ClaimResponse:
     return ClaimResponse(
         status=ClaimStatus.COMPLETED,
@@ -516,6 +562,7 @@ def _completed_response(
         reason=decision.reason,
         rejection_reasons=decision.rejection_reasons,
         line_item_decisions=decision.line_item_decisions,
+        extracted_document_data=extracted_document_data or [],
         trace=trace,
         retrieved_policy_evidence=evidence,
         component_failures=component_failures,

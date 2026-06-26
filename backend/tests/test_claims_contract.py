@@ -124,6 +124,49 @@ def test_clean_consultation_applies_copay() -> None:
     assert payload["decision"]["decision"] == "APPROVED"
     assert payload["approved_amount"] == 1350
     assert payload["confidence_score"] > 0.85
+    assert {item["component"] for item in payload["trace"]} >= {
+        "DocumentVerifierAgent",
+        "VisionExtractionAgent",
+        "StructuredNormalizationAgent",
+        "PatientConsistencyAgent",
+    }
+    assert payload["extracted_document_data"][0]["fields"]["diagnosis"] == "Viral Fever"
+
+
+def test_extraction_pipeline_stops_for_normalized_patient_mismatch() -> None:
+    client = TestClient(app)
+
+    response = client.post(
+        "/claims/submit",
+        json={
+            "member_id": "EMP001",
+            "policy_id": "PLUM_GHI_2024",
+            "claim_category": "CONSULTATION",
+            "treatment_date": "2024-11-01",
+            "claimed_amount": 1500,
+            "documents": [
+                {
+                    "file_id": "F051",
+                    "file_name": "prescription.jpg",
+                    "actual_type": "PRESCRIPTION",
+                    "content": {"patientName": "Rajesh Kumar", "diagnosis": "Viral Fever"},
+                },
+                {
+                    "file_id": "F052",
+                    "file_name": "hospital_bill.jpg",
+                    "actual_type": "HOSPITAL_BILL",
+                    "content": {"patientName": "Arjun Mehta", "amount": "1500"},
+                },
+            ],
+        },
+    )
+
+    payload = response.json()
+    assert payload["status"] == "ACTION_REQUIRED"
+    assert payload["decision"] is None
+    assert payload["member_action_required"]["code"] == "PATIENT_MISMATCH"
+    assert payload["extracted_document_data"][0]["fields"]["patient_name"] == "Rajesh Kumar"
+    assert "Extracted patient names are inconsistent" in payload["reason"]
 
 
 def test_submit_claim_rejects_mismatched_policy_id() -> None:
