@@ -1,6 +1,7 @@
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, HTTPException, Request, status
 
-from app.models import ClaimResponse, ClaimStatus, ClaimSubmission, TraceEvent
+from app.models import ClaimResponse, ClaimSubmission
+from app.services.claims_processor import process_claim
 
 router = APIRouter(prefix="/claims", tags=["claims"])
 
@@ -13,25 +14,9 @@ _CLAIMS: dict[str, ClaimResponse] = {}
     status_code=status.HTTP_202_ACCEPTED,
     summary="Accept a claim submission",
 )
-async def submit_claim(submission: ClaimSubmission) -> ClaimResponse:
-    response = ClaimResponse(
-        status=ClaimStatus.RECEIVED,
-        submission=submission,
-        trace=[
-            TraceEvent(
-                component="ClaimIntakeAPI",
-                message="Claim submission accepted. Processing pipeline is not attached yet.",
-                input_summary={
-                    "member_id": submission.member_id,
-                    "policy_id": submission.policy_id,
-                    "claim_category": submission.claim_category,
-                    "claimed_amount": submission.claimed_amount,
-                    "document_count": len(submission.documents),
-                },
-                output_summary={"status": ClaimStatus.RECEIVED},
-            )
-        ],
-    )
+async def submit_claim(request: Request, submission: ClaimSubmission) -> ClaimResponse:
+    policy = getattr(request.app.state, "policy_terms", None)
+    response = process_claim(submission, policy=policy)
     _CLAIMS[response.claim_id] = response
     return response
 
@@ -49,4 +34,3 @@ async def get_claim(claim_id: str) -> ClaimResponse:
             detail=f"Claim '{claim_id}' was not found.",
         )
     return claim
-

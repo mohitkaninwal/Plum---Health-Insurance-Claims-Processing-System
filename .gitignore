@@ -11,4 +11,5 @@ out/
 dist/
 coverage/
 .turbo/
-
+*.tsbuildinfo
+tsconfig.tsbuildinfo
