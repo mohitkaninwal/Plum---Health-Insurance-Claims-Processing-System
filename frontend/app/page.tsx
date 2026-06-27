@@ -813,7 +813,7 @@ export default function Home() {
         {view !== "eval" ? (
         <section
           id={view === "submit" ? "submit-section" : "decision-section"}
-          className={`scroll-mt-32 gap-6 ${view === "decision" ? "grid xl:grid-cols-[1.04fr_0.96fr]" : "flex justify-center"}`}
+          className={`scroll-mt-32 ${view === "decision" ? "" : "flex justify-center"}`}
         >
           <div className={view === "decision" ? "hidden" : "w-full max-w-2xl space-y-5"}>
             <Panel title="New claim" icon={<UploadCloud className="h-4 w-4" />}>
@@ -1130,36 +1130,72 @@ export default function Home() {
                   </div>
 
                   {/* Validation error from previous submission */}
-                  {submitValidationError && (
-                    <div className="flex items-start gap-3 rounded-[14px] border border-[#f5c9a0] bg-[#fff7ed] p-4">
-                      <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-[#f97316]" />
-                      <div className="min-w-0 flex-1">
-                        <p className="text-xs font-semibold uppercase tracking-[0.14em] text-[#92400e]">
-                          {submitValidationError.code.replace(/_/g, " ")}
-                        </p>
-                        <p className="mt-1 text-sm leading-6 text-[#78350f]">{submitValidationError.message}</p>
-                        <p className="mt-1 text-xs text-[#92400e]/70">
-                          If the document type was misidentified, go back to step 1 and correct the type in the dropdown before resubmitting.
-                        </p>
-                        {submitValidationError.required_document_types?.length ? (
-                          <div className="mt-2 flex flex-wrap gap-1.5">
-                            {submitValidationError.required_document_types.map((dt) => (
-                              <span key={dt} className="rounded-full bg-[#fed7aa] px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.12em] text-[#92400e]">
-                                {dt.replace(/_/g, " ")}
+                  {submitValidationError && (() => {
+                    const code = submitValidationError.code;
+                    const docTypes = submitValidationError.required_document_types ?? [];
+
+                    // Specific label + colours per error code
+                    const DOC_LABELS: Record<string, string> = {
+                      HOSPITAL_BILL: "Hospital Bill",
+                      PRESCRIPTION: "Doctor's Prescription",
+                      LAB_REPORT: "Lab / Diagnostic Report",
+                      PHARMACY_BILL: "Pharmacy Bill",
+                    };
+                    const specificDoc = docTypes.length === 1 ? (DOC_LABELS[docTypes[0]] ?? docTypes[0].replace(/_/g, " ")) : null;
+
+                    type BannerStyle = { border: string; bg: string; badge: string; badgeText: string; icon: string; text: string; sub: string };
+                    const STYLES: Record<string, BannerStyle> = {
+                      MISSING_REQUIRED_DOCUMENT: { border: "border-[#f5c9a0]", bg: "bg-[#fff7ed]", badge: "bg-[#fed7aa] text-[#92400e]", badgeText: specificDoc ? `Missing: ${specificDoc}` : "Missing Document", icon: "text-[#f97316]", text: "text-[#92400e]", sub: "text-[#78350f]" },
+                      UNREADABLE_DOCUMENT:        { border: "border-[#fde68a]", bg: "bg-[#fffbeb]", badge: "bg-[#fef08a] text-[#713f12]", badgeText: "Unreadable Document",  icon: "text-[#d97706]", text: "text-[#713f12]", sub: "text-[#92400e]" },
+                      WRONG_DOCUMENT_TYPE:        { border: "border-[#fde68a]", bg: "bg-[#fffbeb]", badge: "bg-[#fef08a] text-[#713f12]", badgeText: "Wrong Document Type",   icon: "text-[#d97706]", text: "text-[#713f12]", sub: "text-[#92400e]" },
+                      PATIENT_MISMATCH:           { border: "border-[#e9d5ff]", bg: "bg-[#faf5ff]", badge: "bg-[#e9d5ff] text-[#6b21a8]", badgeText: "Patient Name Mismatch", icon: "text-[#9333ea]", text: "text-[#6b21a8]", sub: "text-[#7c3aed]" },
+                    };
+                    const s: BannerStyle = STYLES[code] ?? STYLES["MISSING_REQUIRED_DOCUMENT"];
+
+                    // Message structure: headline \n\n context \n\n qualifies \n\n not-qualifies \n\n action
+                    const paras = submitValidationError.message.split(/\n\n+/).map((p) => p.trim()).filter(Boolean);
+                    // Context = second paragraph ("Your X claim (Claim ID: ...) requires...")
+                    const context = paras[1] ?? "";
+                    // Action = last paragraph ("Submit your claim again..." / "Upload a government ID...")
+                    const action = paras.length > 2 ? paras[paras.length - 1] : "";
+
+                    return (
+                      <div className={`rounded-[14px] border ${s.border} ${s.bg} p-4`}>
+                        <div className="flex items-start justify-between gap-3">
+                          <div className="flex items-start gap-2.5">
+                            <AlertCircle className={`mt-0.5 h-4 w-4 shrink-0 ${s.icon}`} />
+                            <div className="space-y-1">
+                              <span className={`inline-block rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.14em] ${s.badge}`}>
+                                {s.badgeText}
+                              </span>
+                              {context && (
+                                <p className={`text-xs leading-5 ${s.sub}`}>{context}</p>
+                              )}
+                            </div>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() => setSubmitValidationError(null)}
+                            className={`shrink-0 opacity-50 hover:opacity-100 ${s.text}`}
+                          >
+                            <XCircle className="h-4 w-4" />
+                          </button>
+                        </div>
+                        {docTypes.length > 1 && (
+                          <div className="mt-2.5 flex flex-wrap gap-1.5">
+                            {docTypes.map((dt) => (
+                              <span key={dt} className={`rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.12em] ${s.badge}`}>
+                                {DOC_LABELS[dt] ?? dt.replace(/_/g, " ")}
                               </span>
                             ))}
                           </div>
-                        ) : null}
+                        )}
+                        {action && (
+                          <p className={`mt-2.5 text-xs font-medium ${s.text}`}>{action}</p>
+                        )}
                       </div>
-                      <button
-                        type="button"
-                        onClick={() => setSubmitValidationError(null)}
-                        className="shrink-0 text-[#92400e]/50 hover:text-[#92400e]"
-                      >
-                        <XCircle className="h-4 w-4" />
-                      </button>
-                    </div>
-                  )}
+                    );
+                  })()}
 
                   {/* Submit row */}
                   <div className="flex flex-wrap items-center justify-between gap-3 rounded-[18px] border border-[color:var(--line)] bg-[#fffaf2] p-4">
@@ -1190,124 +1226,129 @@ export default function Home() {
           <div className={view === "decision" ? "space-y-6" : "hidden"}>
             {claimResponse ? (
               <>
-                {/* Claim metadata header */}
-                <div className="rounded-[18px] border border-[color:var(--line)] bg-white p-4">
-                  <div className="flex flex-wrap items-center justify-between gap-3">
+                {/* Claim header banner */}
+                <div className="overflow-hidden rounded-[22px] bg-[linear-gradient(135deg,#1d0716_0%,#3a1128_60%,#251020_100%)] p-6 text-white shadow-[0_8px_32px_rgba(29,7,22,0.22)]">
+                  <div className="flex flex-wrap items-start justify-between gap-4">
                     <div>
-                      <p className="text-xs font-semibold uppercase tracking-[0.18em] text-[var(--muted)]">Claim ID</p>
-                      <p className="mt-0.5 font-mono text-sm font-semibold text-[var(--ink)]">{claimResponse.claim_id}</p>
+                      <p className="text-[11px] font-semibold uppercase tracking-[0.22em] text-[#fff1e5]/55">Claim ID</p>
+                      <p className="mt-1.5 font-mono text-xl font-semibold tracking-wide text-white">{claimResponse.claim_id}</p>
                     </div>
-                    <div className="flex items-center gap-2">
+                    <div className="flex flex-wrap items-center gap-2">
                       {typeof (claimResponse.confidence_score ?? claimResponse.decision?.confidence_score) === "number" && (
-                        <span className="rounded-full bg-[#f3ede8] px-3 py-1 text-xs font-semibold text-[var(--ink)]">
+                        <span className="rounded-full border border-white/15 bg-white/10 px-3.5 py-1.5 text-xs font-semibold text-[#fff1e5]/90">
                           Confidence {Math.round(((claimResponse.confidence_score ?? claimResponse.decision?.confidence_score) as number) * 100)}%
                         </span>
                       )}
-                      <span className={`rounded-full px-3 py-1.5 text-xs font-semibold uppercase tracking-[0.14em] ${
-                        claimResponse.status === "COMPLETED" ? "bg-[#e7f4ee] text-[#1f8f5c]"
-                        : claimResponse.status === "ACTION_REQUIRED" ? "bg-[#fff1db] text-[#9f5f17]"
-                        : claimResponse.status === "FAILED" ? "bg-[#ffe0dd] text-[#a83d35]"
-                        : "bg-[#f3ede8] text-[var(--muted)]"
+                      <span className={`rounded-full px-3.5 py-1.5 text-xs font-semibold uppercase tracking-[0.14em] ${
+                        claimResponse.status === "COMPLETED" ? "bg-[#d1fae5] text-[#065f46]"
+                        : claimResponse.status === "ACTION_REQUIRED" ? "bg-[#fef3c7] text-[#92400e]"
+                        : claimResponse.status === "FAILED" ? "bg-[#fee2e2] text-[#991b1b]"
+                        : "bg-white/15 text-[#fff1e5]/80"
                       }`}>
                         {claimResponse.status.replace(/_/g, " ")}
                       </span>
                     </div>
                   </div>
                   {claimResponse.submission && (
-                    <div className="mt-3 grid grid-cols-2 gap-x-6 gap-y-2 border-t border-[color:var(--line)] pt-3 sm:grid-cols-4">
+                    <div className="mt-5 grid grid-cols-2 gap-x-8 gap-y-3 border-t border-white/10 pt-5 sm:grid-cols-4 lg:grid-cols-6">
                       <div>
-                        <p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-[var(--muted)]">Member</p>
-                        <p className="mt-0.5 text-sm font-medium text-[var(--ink)]">{claimResponse.submission.member_id}</p>
+                        <p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-[#fff1e5]/50">Member</p>
+                        <p className="mt-1 text-sm font-medium text-[#fff1e5]/90">{claimResponse.submission.member_id}</p>
                       </div>
                       <div>
-                        <p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-[var(--muted)]">Category</p>
-                        <p className="mt-0.5 text-sm font-medium text-[var(--ink)]">{claimResponse.submission.claim_category.replace(/_/g, " ")}</p>
+                        <p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-[#fff1e5]/50">Category</p>
+                        <p className="mt-1 text-sm font-medium text-[#fff1e5]/90">{claimResponse.submission.claim_category.replace(/_/g, " ")}</p>
                       </div>
                       <div>
-                        <p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-[var(--muted)]">Treatment date</p>
-                        <p className="mt-0.5 text-sm font-medium text-[var(--ink)]">{claimResponse.submission.treatment_date}</p>
+                        <p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-[#fff1e5]/50">Treatment date</p>
+                        <p className="mt-1 text-sm font-medium text-[#fff1e5]/90">{claimResponse.submission.treatment_date}</p>
                       </div>
                       <div>
-                        <p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-[var(--muted)]">Claimed amount</p>
-                        <p className="mt-0.5 text-sm font-medium text-[var(--ink)]">INR {claimResponse.submission.claimed_amount.toLocaleString("en-IN")}</p>
+                        <p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-[#fff1e5]/50">Claimed amount</p>
+                        <p className="mt-1 text-sm font-medium text-[#fff1e5]/90">INR {claimResponse.submission.claimed_amount.toLocaleString("en-IN")}</p>
                       </div>
+                      {typeof (claimResponse.approved_amount ?? claimResponse.decision?.approved_amount) === "number" && (
+                        <div>
+                          <p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-[#fff1e5]/50">Approved amount</p>
+                          <p className="mt-1 text-sm font-semibold text-[#86efac]">
+                            INR {((claimResponse.approved_amount ?? claimResponse.decision?.approved_amount) as number).toLocaleString("en-IN")}
+                          </p>
+                        </div>
+                      )}
                       {claimResponse.submission.hospital_name && (
                         <div className="col-span-2">
-                          <p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-[var(--muted)]">Hospital</p>
-                          <p className="mt-0.5 text-sm font-medium text-[var(--ink)]">{claimResponse.submission.hospital_name}</p>
+                          <p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-[#fff1e5]/50">Hospital</p>
+                          <p className="mt-1 text-sm font-medium text-[#fff1e5]/90">{claimResponse.submission.hospital_name}</p>
                         </div>
                       )}
                       {claimResponse.submitted_at && (
                         <div className="col-span-2">
-                          <p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-[var(--muted)]">Submitted at</p>
-                          <p className="mt-0.5 text-sm font-medium text-[var(--ink)]">{new Date(claimResponse.submitted_at).toLocaleString("en-IN")}</p>
+                          <p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-[#fff1e5]/50">Submitted at</p>
+                          <p className="mt-1 text-sm font-medium text-[#fff1e5]/90">{new Date(claimResponse.submitted_at).toLocaleString("en-IN")}</p>
                         </div>
                       )}
                     </div>
                   )}
                 </div>
 
-                <Panel title="Decision review" icon={<BadgeCheck className="h-4 w-4" />}>
-                  {activeDecision ? (
-                    <div className="grid gap-4 md:grid-cols-[0.78fr_1.22fr]">
-                      <div className="rounded-[22px] border border-[color:var(--line)] bg-[linear-gradient(180deg,#1d0716,#351325)] p-5 text-white">
-                        <p className="text-xs font-semibold uppercase tracking-[0.18em] text-[#fff1e5]/60">
-                          Final decision
-                        </p>
-                        <div className="mt-4 flex items-center gap-3">
-                          <DecisionBadge decision={activeDecision.decision} />
-                          <div>
-                            <div className="text-3xl font-semibold tracking-[-0.03em]">
+                {/* Decision + Line-items (left) | Document validation (right) */}
+                <div className={`grid gap-6 ${(claimResponse.extracted_document_data?.length ?? 0) > 0 ? "xl:grid-cols-[1.1fr_0.9fr]" : ""}`}>
+                  {/* Left column: Decision review + Line-item adjudication */}
+                  <div className="space-y-6">
+                  <Panel title="Decision review" icon={<BadgeCheck className="h-4 w-4" />}>
+                    {activeDecision ? (
+                      <div className="grid gap-5 md:grid-cols-[0.82fr_1.18fr]">
+                        {/* Left: dark decision card */}
+                        <div className="flex flex-col justify-between rounded-[20px] bg-[linear-gradient(160deg,#1d0716,#351325)] p-5 text-white">
+                          <p className="text-[10px] font-semibold uppercase tracking-[0.22em] text-[#fff1e5]/55">Final decision</p>
+                          <div className="mt-4 space-y-1">
+                            <DecisionBadge decision={activeDecision.decision} />
+                            <div className="pt-2 text-3xl font-semibold tracking-[-0.03em]">
                               INR {activeDecision.approved_amount.toLocaleString("en-IN")}
                             </div>
-                            <p className="text-sm text-[#fff1e5]/70">Approved amount</p>
+                            <p className="text-xs text-[#fff1e5]/60">Approved amount</p>
                           </div>
-                        </div>
-                        <div className="mt-5 rounded-[18px] border border-white/10 bg-white/5 p-4">
-                          <p className="text-xs font-semibold uppercase tracking-[0.18em] text-[#fff1e5]/60">
-                            Confidence
-                          </p>
-                          <div className="mt-3 flex items-end gap-3">
-                            <div className="text-3xl font-semibold">
-                              {Math.round((activeDecision.confidence_score ?? 0) * 100)}%
-                            </div>
-                            <div className="flex-1">
-                              <div className="h-2 overflow-hidden rounded-full bg-white/10">
-                                <div
-                                  className="h-full rounded-full bg-[#ffb591]"
-                                  style={{ width: `${Math.round((activeDecision.confidence_score ?? 0) * 100)}%` }}
-                                />
+                          <div className="mt-5 rounded-[16px] border border-white/10 bg-white/5 p-4">
+                            <p className="text-[10px] font-semibold uppercase tracking-[0.18em] text-[#fff1e5]/55">Confidence</p>
+                            <div className="mt-3 flex items-end gap-3">
+                              <div className="text-3xl font-semibold">{Math.round((activeDecision.confidence_score ?? 0) * 100)}%</div>
+                              <div className="mb-1 flex-1">
+                                <div className="h-2 overflow-hidden rounded-full bg-white/10">
+                                  <div className="h-full rounded-full bg-[#ffb591]" style={{ width: `${Math.round((activeDecision.confidence_score ?? 0) * 100)}%` }} />
+                                </div>
                               </div>
                             </div>
                           </div>
                         </div>
-                      </div>
-
-                      <div className="space-y-4">
-                        <SummaryRow label="Reason" value={activeDecision.reason} />
-                        <SummaryRow
-                          label="Member action required"
-                          value={claimResponse.member_action_required?.message ?? "None"}
-                        />
-                        <SummaryRow
-                          label="Rejection reasons"
-                          value={claimResponse.rejection_reasons?.length ? claimResponse.rejection_reasons.join(", ") : "None"}
-                        />
-                        <SummaryRow
-                          label="Warnings"
-                          value={claimResponse.component_failures?.length ? claimResponse.component_failures.map((item) => item.message).join(" · ") : "No component failures"}
-                        />
-                      </div>
-                    </div>
-                  ) : claimResponse.member_action_required ? (
-                    <div className="space-y-4">
-                      <div className="flex items-start gap-4 rounded-[18px] border border-[#f5c9a0] bg-[#fff7ed] p-5">
-                        <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-[#f97316] text-white">
-                          <AlertCircle className="h-5 w-5" />
+                        {/* Right: summary rows — always shown */}
+                        <div className="space-y-3">
+                          <SummaryRow label="Reason" value={activeDecision.reason} />
+                          <SummaryRow
+                            label="Member action required"
+                            value={claimResponse.member_action_required?.message ?? "None"}
+                          />
+                          <SummaryRow
+                            label="Rejection reasons"
+                            value={claimResponse.rejection_reasons?.length ? claimResponse.rejection_reasons.join(", ") : "None"}
+                          />
+                          <SummaryRow
+                            label="Warnings"
+                            value={claimResponse.component_failures?.length ? claimResponse.component_failures.map((f) => f.message).join(" · ") : "No component failures"}
+                          />
                         </div>
-                        <div>
-                          <p className="text-xs font-semibold uppercase tracking-[0.18em] text-[#92400e]">Action required · {claimResponse.member_action_required.code}</p>
-                          <p className="mt-1 text-sm font-semibold leading-6 text-[#78350f]">{claimResponse.member_action_required.message}</p>
+                      </div>
+                    ) : claimResponse.member_action_required ? (
+                      <div className="space-y-5">
+                        <div className="rounded-[18px] border border-[#f5c9a0] bg-[#fff7ed] p-5">
+                          <div className="flex items-center gap-3">
+                            <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-[#f97316] text-white">
+                              <AlertCircle className="h-4 w-4" />
+                            </div>
+                            <div>
+                              <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-[#92400e]">Action required</p>
+                              <p className="mt-0.5 text-xs font-medium text-[#b45309]">{claimResponse.member_action_required.code.replace(/_/g, " ")}</p>
+                            </div>
+                          </div>
                           {claimResponse.member_action_required.required_document_types?.length ? (
                             <div className="mt-3 flex flex-wrap gap-2">
                               {claimResponse.member_action_required.required_document_types.map((dt) => (
@@ -1316,85 +1357,90 @@ export default function Home() {
                             </div>
                           ) : null}
                         </div>
-                      </div>
-                      {claimResponse.reason ? (
-                        <SummaryRow label="Details" value={claimResponse.reason} />
-                      ) : null}
-                      {typeof claimResponse.confidence_score === "number" && (
-                        <div className="flex items-center gap-3 rounded-[14px] border border-[color:var(--line)] bg-white p-3">
-                          <div className="flex-1">
-                            <p className="text-xs font-semibold uppercase tracking-[0.14em] text-[var(--muted)]">Confidence score</p>
-                            <div className="mt-2 flex items-center gap-3">
-                              <span className="text-lg font-semibold text-[var(--ink)]">{Math.round(claimResponse.confidence_score * 100)}%</span>
+                        <SummaryRow label="What to do" value={claimResponse.member_action_required.message} />
+                        {typeof claimResponse.confidence_score === "number" && (
+                          <div className="flex items-center gap-4 rounded-[14px] border border-[color:var(--line)] bg-[#fffaf2] px-4 py-3">
+                            <p className="text-xs font-semibold uppercase tracking-[0.14em] text-[var(--muted)]">Confidence</p>
+                            <div className="flex flex-1 items-center gap-3">
                               <div className="h-2 flex-1 overflow-hidden rounded-full bg-[#f3ede8]">
                                 <div className="h-full rounded-full bg-[var(--plum)]" style={{ width: `${Math.round(claimResponse.confidence_score * 100)}%` }} />
                               </div>
+                              <span className="text-sm font-semibold text-[var(--ink)]">{Math.round(claimResponse.confidence_score * 100)}%</span>
                             </div>
-                          </div>
-                        </div>
-                      )}
-                    </div>
-                  ) : (
-                    <div className="flex items-start gap-4 rounded-[18px] border border-[color:var(--line)] bg-[#f7f1ea] p-5">
-                      <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-[var(--muted)]/20 text-[var(--muted)]">
-                        <Clock3 className="h-5 w-5" />
-                      </div>
-                      <div>
-                        <p className="text-xs font-semibold uppercase tracking-[0.18em] text-[var(--muted)]">Pending</p>
-                        <p className="mt-1 text-sm leading-6 text-[var(--muted)]">{claimResponse.reason ?? "No decision produced yet."}</p>
-                      </div>
-                    </div>
-                  )}
-                </Panel>
-
-                {(claimResponse.extracted_document_data?.length ?? 0) > 0 && (
-                <Panel title="Document validation and extraction" icon={<FileText className="h-4 w-4" />}>
-                  <div className="grid gap-4">
-                    {claimResponse.extracted_document_data?.map((doc) => (
-                      <div key={doc.file_id} className="rounded-[18px] border border-[color:var(--line)] bg-[#fffaf2] p-4">
-                        <div className="flex flex-wrap items-center justify-between gap-2">
-                          <div>
-                            <p className="text-sm font-semibold text-[var(--ink)]">
-                              {doc.file_id} · {doc.document_type.replace(/_/g, " ")}
-                            </p>
-                            <p className="text-xs text-[var(--muted)]">Confidence {Math.round(doc.confidence * 100)}%</p>
-                          </div>
-                          <span className={`rounded-full px-3 py-1 text-xs font-semibold ${doc.missing_fields.length ? "bg-[#fff1db] text-[#9f5f17]" : "bg-[#e7f4ee] text-[#1f8f5c]"}`}>
-                            {doc.missing_fields.length ? `${doc.missing_fields.length} missing field${doc.missing_fields.length > 1 ? "s" : ""}` : "Complete"}
-                          </span>
-                        </div>
-                        {Object.keys(doc.fields).length > 0 && (
-                          <div className="mt-4 grid gap-3 sm:grid-cols-2">
-                            {Object.entries(doc.fields).map(([key, value]) => (
-                              <DetailChip key={key} label={key} value={String(value)} />
-                            ))}
                           </div>
                         )}
                       </div>
-                    ))}
-                  </div>
-                </Panel>
-                )}
+                    ) : (
+                      <div className="flex items-start gap-4 rounded-[18px] border border-[color:var(--line)] bg-[#f7f1ea] p-5">
+                        <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-[var(--muted)]/20 text-[var(--muted)]">
+                          <Clock3 className="h-5 w-5" />
+                        </div>
+                        <div>
+                          <p className="text-xs font-semibold uppercase tracking-[0.18em] text-[var(--muted)]">Pending</p>
+                          <p className="mt-1 text-sm leading-6 text-[var(--muted)]">{claimResponse.reason ?? "No decision produced yet."}</p>
+                        </div>
+                      </div>
+                    )}
+                  </Panel>
 
-                {activeDecision && activeDecision.line_item_decisions.length > 0 && (
-                <Panel title="Line-item adjudication" icon={<Layers3 className="h-4 w-4" />}>
+                  {activeDecision && activeDecision.line_item_decisions.length > 0 && (
+                  <Panel title="Line-item adjudication" icon={<Layers3 className="h-4 w-4" />}>
                   <div className="space-y-3">
                     {activeDecision.line_item_decisions.map((item) => (
-                      <div key={`${item.description}-${item.claimed_amount}`} className="grid gap-3 rounded-[18px] border border-[color:var(--line)] bg-white p-4 md:grid-cols-[1.3fr_0.5fr_0.5fr_0.6fr]">
+                      <div key={`${item.description}-${item.claimed_amount}`} className="grid items-center gap-3 rounded-[18px] border border-[color:var(--line)] bg-[#fffaf2] p-4 md:grid-cols-[1fr_auto_auto_auto]">
                         <div>
                           <p className="font-medium text-[var(--ink)]">{item.description}</p>
-                          <p className="mt-1 text-sm text-[var(--muted)]">{item.reason}</p>
+                          <p className="mt-0.5 text-sm text-[var(--muted)]">{item.reason}</p>
                         </div>
-                        <DetailChip label="Claimed" value={`INR ${item.claimed_amount.toLocaleString("en-IN")}`} />
-                        <DetailChip label="Approved" value={`INR ${item.approved_amount.toLocaleString("en-IN")}`} />
-                        <div className="flex items-center justify-start md:justify-end">
+                        <div className="text-right">
+                          <p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-[var(--muted)]">Claimed</p>
+                          <p className="mt-0.5 text-sm font-semibold text-[var(--ink)]">INR {item.claimed_amount.toLocaleString("en-IN")}</p>
+                        </div>
+                        <div className="text-right">
+                          <p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-[var(--muted)]">Approved</p>
+                          <p className="mt-0.5 text-sm font-semibold text-[var(--ink)]">INR {item.approved_amount.toLocaleString("en-IN")}</p>
+                        </div>
+                        <div className="flex justify-end">
                           <LineBadge decision={item.decision} />
                         </div>
                       </div>
                     ))}
                   </div>
-                </Panel>
-                )}
+                  </Panel>
+                  )}
+
+                  </div>{/* end left column */}
+
+                  {(claimResponse.extracted_document_data?.length ?? 0) > 0 && (
+                  <Panel title="Document validation" icon={<FileText className="h-4 w-4" />}>
+                    <div className="max-h-[600px] space-y-3 overflow-y-auto pr-0.5">
+                      {claimResponse.extracted_document_data?.map((doc) => (
+                        <div key={doc.file_id} className="rounded-[18px] border border-[color:var(--line)] bg-[#fffaf2] p-4">
+                          <div className="flex flex-wrap items-start justify-between gap-2">
+                            <div className="min-w-0">
+                              <p className="truncate text-sm font-semibold text-[var(--ink)]">
+                                {doc.file_id}
+                              </p>
+                              <p className="text-xs text-[var(--muted)]">{doc.document_type.replace(/_/g, " ")} · {Math.round(doc.confidence * 100)}% confidence</p>
+                            </div>
+                            <span className={`shrink-0 rounded-full px-2.5 py-1 text-[10px] font-semibold ${doc.missing_fields.length ? "bg-[#fff1db] text-[#9f5f17]" : "bg-[#e7f4ee] text-[#1f8f5c]"}`}>
+                              {doc.missing_fields.length ? `${doc.missing_fields.length} missing` : "Complete"}
+                            </span>
+                          </div>
+                          {Object.keys(doc.fields).length > 0 && (
+                            <div className="mt-3 grid gap-2 sm:grid-cols-2">
+                              {Object.entries(doc.fields).map(([key, value]) => (
+                                <DocFieldChip key={key} label={key} value={value} />
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  </Panel>
+                  )}
+                </div>
+
               </>
             ) : (
               <EmptyState title="No claim submitted yet" body="Upload a document and submit a claim to populate the review panels." />
@@ -1404,31 +1450,42 @@ export default function Home() {
         ) : null}
 
         {view === "decision" ? (
-        <section className="grid scroll-mt-32 gap-6 xl:grid-cols-[0.92fr_1.08fr]">
+        <section className="grid scroll-mt-32 gap-6 xl:grid-cols-2" id="decision-trace-section">
           {claimResponse ? (
             <>
               <Panel title="Trace timeline" icon={<Clock3 className="h-4 w-4" />}>
-                <div className="space-y-3">
+                <div className="space-y-2">
                   {(claimResponse.trace?.length ?? 0) > 0 ? (
                     claimResponse.trace?.map((event, index) => (
-                      <div key={`${event.component}-${index}`} className="flex gap-4 rounded-[18px] border border-[color:var(--line)] bg-[#fffaf2] p-4">
-                        <div className="mt-1 flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-[var(--plum)] text-xs font-semibold text-white">
+                      <div key={`${event.component}-${index}`} className={`flex gap-3 rounded-[16px] border p-4 ${
+                        event.level === "WARNING" ? "border-[#f5d98a] bg-[#fffbf0]"
+                        : event.level === "ERROR" ? "border-[#f1c4c0] bg-[#fff5f5]"
+                        : "border-[color:var(--line)] bg-[#fffaf2]"
+                      }`}>
+                        <div className={`mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-[10px] font-bold text-white ${
+                          event.level === "WARNING" ? "bg-[#d97706]"
+                          : event.level === "ERROR" ? "bg-[#dc2626]"
+                          : "bg-[var(--plum)]"
+                        }`}>
                           {index + 1}
                         </div>
                         <div className="min-w-0 flex-1">
                           <div className="flex flex-wrap items-center gap-2">
-                            <p className="font-semibold text-[var(--ink)]">{event.component}</p>
-                            <span className={`rounded-full px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.15em] ${
-                              event.level === "WARNING"
-                                ? "bg-[#fff1db] text-[#9f5f17]"
-                                : event.level === "ERROR"
-                                  ? "bg-[#ffe0dd] text-[#a83d35]"
-                                  : "bg-[#e7f4ee] text-[#1f8f5c]"
+                            <p className="text-sm font-semibold text-[var(--ink)]">{event.component}</p>
+                            <span className={`rounded-full px-2 py-0.5 text-[9px] font-semibold uppercase tracking-[0.15em] ${
+                              event.level === "WARNING" ? "bg-[#fef3c7] text-[#92400e]"
+                              : event.level === "ERROR" ? "bg-[#fee2e2] text-[#991b1b]"
+                              : "bg-[#dcfce7] text-[#166534]"
                             }`}>
                               {event.level}
                             </span>
+                            {typeof event.confidence_impact === "number" && event.confidence_impact !== 0 && (
+                              <span className={`text-[10px] font-semibold tabular-nums ${event.confidence_impact > 0 ? "text-[#16a34a]" : "text-[#dc2626]"}`}>
+                                {event.confidence_impact > 0 ? "+" : ""}{(event.confidence_impact * 100).toFixed(1)}%
+                              </span>
+                            )}
                           </div>
-                          <p className="mt-1 text-sm leading-6 text-[var(--muted)]">{event.message}</p>
+                          <p className="mt-1 text-sm leading-5 text-[var(--muted)]">{event.message}</p>
                         </div>
                       </div>
                     ))
@@ -1438,37 +1495,43 @@ export default function Home() {
                 </div>
               </Panel>
 
-              <Panel title="Policy evidence and warnings" icon={<Hospital className="h-4 w-4" />}>
-                <div className="space-y-6">
-                  <div className="space-y-3">
+              <Panel title="Policy evidence & warnings" icon={<Hospital className="h-4 w-4" />}>
+                <div className="space-y-5">
+                  <div className="space-y-2">
+                    <p className="text-[10px] font-semibold uppercase tracking-[0.18em] text-[var(--muted)]">Retrieved evidence</p>
                     {(() => {
                       const policyEvidence = (claimResponse.retrieved_policy_evidence ?? []).filter(
                         (e) => !e.source.toLowerCase().includes("sample_documents_guide") && e.rule_category !== "document_extraction"
                       );
                       return policyEvidence.length > 0 ? (
                         policyEvidence.map((evidence) => {
-                          const cleanText = evidence.text
-                            .replace(/```[\s\S]*?```/g, "")
-                            .replace(/#{1,6}\s*/g, "")
-                            .replace(/\*\*/g, "")
-                            .replace(/\|[-| ]+\|/g, "")
-                            .replace(/\|/g, " ")
-                            .replace(/\n{2,}/g, " · ")
-                            .replace(/\n/g, " ")
-                            .replace(/\s{2,}/g, " ")
-                            .trim();
-                          const displayText = cleanText.length > 220 ? cleanText.slice(0, 220) + "…" : cleanText;
+                          // Parse: "{description}. JSON path: key {json...}"
+                          const jpIdx = evidence.text.indexOf("JSON path:");
+                          const description = jpIdx !== -1
+                            ? evidence.text.slice(0, jpIdx).trim().replace(/\.$/, "")
+                            : evidence.text.slice(0, 160).trim();
+                          let jsonData: unknown = null;
+                          if (jpIdx !== -1) {
+                            const rest = evidence.text.slice(jpIdx + 10).trim();
+                            const jStart = rest.search(/[{[]/);
+                            if (jStart !== -1) {
+                              try { jsonData = JSON.parse(rest.slice(jStart)); } catch { /* leave null */ }
+                            }
+                          }
                           return (
-                            <div key={evidence.evidence_id} className="rounded-[18px] border border-[color:var(--line)] bg-[#fffaf2] p-4">
+                            <div key={evidence.evidence_id} className="rounded-[16px] border border-[color:var(--line)] bg-[#fffaf2] p-4">
                               <div className="flex items-center justify-between gap-3">
-                                <p className="font-semibold capitalize text-[var(--ink)]">{evidence.rule_category.replace(/_/g, " ")}</p>
-                                {typeof evidence.rrf_score === "number" ? (
-                                  <span className="rounded-full bg-white px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.15em] text-[var(--muted)]">
-                                    score {evidence.rrf_score.toFixed(3)}
+                                <p className="text-sm font-semibold capitalize text-[var(--ink)]">{evidence.rule_category.replace(/_/g, " ")}</p>
+                                {typeof evidence.rrf_score === "number" && (
+                                  <span className="shrink-0 rounded-full bg-white px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.15em] text-[var(--muted)]">
+                                    {evidence.rrf_score.toFixed(3)}
                                   </span>
-                                ) : null}
+                                )}
                               </div>
-                              <p className="mt-2 text-sm leading-6 text-[var(--muted)]">{displayText}</p>
+                              {description && (
+                                <p className="mt-1 text-xs leading-5 text-[var(--muted)]">{description}</p>
+                              )}
+                              {jsonData !== null && <PolicyDataDisplay data={jsonData} />}
                             </div>
                           );
                         })
@@ -1477,27 +1540,31 @@ export default function Home() {
                       );
                     })()}
                   </div>
-                  <div className="space-y-3">
-                    {(claimResponse.component_failures?.length ?? 0) > 0 ? (
-                      claimResponse.component_failures?.map((failure) => (
-                        <div key={`${failure.component}-${failure.message}`} className="rounded-[18px] border border-[#f1c4c0] bg-[#fff1f1] p-4">
+
+                  {(claimResponse.component_failures?.length ?? 0) > 0 && (
+                    <div className="space-y-2">
+                      <p className="text-[10px] font-semibold uppercase tracking-[0.18em] text-[var(--muted)]">Component failures</p>
+                      {claimResponse.component_failures?.map((failure) => (
+                        <div key={`${failure.component}-${failure.message}`} className="rounded-[16px] border border-[#f1c4c0] bg-[#fff5f5] p-4">
                           <div className="flex items-center gap-2">
-                            <AlertCircle className="h-4 w-4 text-[#a83d35]" />
-                            <p className="font-semibold text-[#7f241d]">{failure.component}</p>
+                            <AlertCircle className="h-4 w-4 shrink-0 text-[#dc2626]" />
+                            <p className="text-sm font-semibold text-[#7f1d1d]">{failure.component}</p>
                           </div>
                           <p className="mt-2 text-sm leading-6 text-[#9c3b34]">{failure.message}</p>
                         </div>
-                      ))
-                    ) : (
-                      <EmptyState title="No component failures" body="Warnings and recoverable failures appear here when present." />
-                    )}
-                    {claimResponse.member_action_required ? (
-                      <div className="rounded-[18px] border border-[#f5cfb8] bg-[#fff4eb] p-4">
-                        <p className="text-sm font-semibold text-[#9f5f17]">Member action required</p>
-                        <p className="mt-2 text-sm leading-6 text-[#a06a2a]">{claimResponse.member_action_required.message}</p>
+                      ))}
+                    </div>
+                  )}
+
+                  {claimResponse.member_action_required && (
+                    <div className="space-y-2">
+                      <p className="text-[10px] font-semibold uppercase tracking-[0.18em] text-[var(--muted)]">Member action required</p>
+                      <div className="rounded-[16px] border border-[#f5d0a9] bg-[#fff8f0] p-4">
+                        <p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-[#9f5f17]">{claimResponse.member_action_required.code.replace(/_/g, " ")}</p>
+                        <p className="mt-2 whitespace-pre-line text-sm leading-6 text-[#a06a2a]">{claimResponse.member_action_required.message}</p>
                       </div>
-                    ) : null}
-                  </div>
+                    </div>
+                  )}
                 </div>
               </Panel>
             </>
@@ -1810,16 +1877,183 @@ function SummaryRow({ label, value }: { label: string; value: string }) {
   return (
     <div className="rounded-[18px] border border-[color:var(--line)] bg-[#fffaf2] p-4">
       <p className="text-xs font-semibold uppercase tracking-[0.18em] text-[var(--muted)]">{label}</p>
-      <p className="mt-2 text-sm leading-6 text-[var(--ink)]">{value}</p>
+      <p className="mt-2 whitespace-pre-line text-sm leading-6 text-[var(--ink)]">{value}</p>
+    </div>
+  );
+}
+
+function PolicyDataDisplay({ data }: { data: unknown }) {
+  // Array of strings → tag list
+  if (Array.isArray(data) && data.every((v) => typeof v === "string")) {
+    const items = data as string[];
+    const show = items.slice(0, 8);
+    const extra = items.length - show.length;
+    return (
+      <div className="mt-2 flex flex-wrap gap-1.5">
+        {show.map((s, i) => (
+          <span key={i} className="rounded-full bg-white border border-[color:var(--line)] px-2.5 py-0.5 text-xs font-medium text-[var(--ink)]">{s}</span>
+        ))}
+        {extra > 0 && (
+          <span className="rounded-full bg-[#f3ede8] px-2.5 py-0.5 text-xs font-medium text-[var(--muted)]">+{extra} more</span>
+        )}
+      </div>
+    );
+  }
+  // Object → key-value grid
+  if (data !== null && typeof data === "object" && !Array.isArray(data)) {
+    const entries = Object.entries(data as Record<string, unknown>);
+    return (
+      <div className="mt-2 grid gap-x-4 gap-y-1.5 sm:grid-cols-2">
+        {entries.map(([k, v]) => {
+          const label = k.replace(/_/g, " ");
+          let display: React.ReactNode;
+          if (v === null || v === undefined) {
+            display = <span className="text-[var(--muted)]">—</span>;
+          } else if (Array.isArray(v)) {
+            const strs = v.map(String);
+            const shown = strs.slice(0, 4).join(", ");
+            display = (
+              <span>{shown}{strs.length > 4 ? ` +${strs.length - 4} more` : ""}</span>
+            );
+          } else if (typeof v === "object") {
+            display = <span className="text-[var(--muted)]">{Object.keys(v as object).length} fields</span>;
+          } else if (typeof v === "boolean") {
+            display = (
+              <span className={v ? "text-[#1f8f5c]" : "text-[#dc2626]"}>{v ? "Yes" : "No"}</span>
+            );
+          } else {
+            const s = String(v);
+            display = <span>{s.length > 60 ? s.slice(0, 60) + "…" : s}</span>;
+          }
+          return (
+            <div key={k} className="flex gap-1.5 text-xs">
+              <span className="shrink-0 font-semibold capitalize text-[var(--ink)]">{label}:</span>
+              <span className="text-[var(--muted)]">{display}</span>
+            </div>
+          );
+        })}
+      </div>
+    );
+  }
+  return <p className="mt-2 text-xs text-[var(--muted)]">{String(data)}</p>;
+}
+
+function DocFieldChip({ label, value }: { label: string; value: unknown }) {
+  const isLongString = typeof value === "string" && value.length > 80 && value.includes(", ");
+  const isComplex = Array.isArray(value) || (value !== null && typeof value === "object") || isLongString;
+
+  const renderContent = () => {
+    if (value === null || value === undefined) {
+      return <p className="mt-1 text-sm font-medium text-[var(--ink)]">—</p>;
+    }
+    if (Array.isArray(value)) {
+      // Array of objects with description/amount (line_items)
+      if (value.length > 0 && typeof value[0] === "object" && value[0] !== null) {
+        return (
+          <ul className="mt-1 space-y-1">
+            {(value as Record<string, unknown>[]).map((item, i) => {
+              const desc = item.description ?? item.name ?? item.item ?? Object.values(item)[0];
+              const amt = item.amount ?? item.price ?? item.cost ?? item.value ?? Object.values(item)[1];
+              const hasAmt = amt !== undefined && amt !== null;
+              return (
+                <li key={i} className="text-sm text-[var(--ink)]">
+                  <span className="text-[var(--muted)]">•</span>{" "}
+                  {String(desc ?? JSON.stringify(item))}
+                  {hasAmt && <span className="ml-1 font-medium">— INR {Number(amt).toLocaleString("en-IN")}</span>}
+                </li>
+              );
+            })}
+          </ul>
+        );
+      }
+      // Array of scalars
+      return (
+        <p className="mt-1 text-sm text-[var(--ink)]">
+          {(value as unknown[]).map(String).join(", ")}
+        </p>
+      );
+    }
+    if (typeof value === "object") {
+      return (
+        <ul className="mt-1 space-y-0.5">
+          {Object.entries(value as Record<string, unknown>).map(([k, v]) => (
+            <li key={k} className="text-sm text-[var(--ink)]">
+              <span className="font-medium">{k}:</span> {String(v ?? "—")}
+            </li>
+          ))}
+        </ul>
+      );
+    }
+    // Long comma-separated string — try to parse as lab test entries
+    const str = String(value);
+    if (str.length > 80 && str.includes(", ")) {
+      const items = str.split(/, /);
+      const isNum = (s: string) => /^\d/.test(s.trim());
+      const isTestName = (s: string, nextS?: string) =>
+        /^[A-Za-z\u0080-\uFFFF]/.test(s.trim()) && s.trim().length > 1 && !!nextS && isNum(nextS);
+
+      // Collect test entries: {name, value, unit, range}
+      type TestRow = { name: string; val: string; unit: string; range: string };
+      const rows: TestRow[] = [];
+      let i = 0;
+      // Skip header items (e.g. "Result, Unit, Normal Range, Flag")
+      while (i < items.length && !isTestName(items[i], items[i + 1])) i++;
+
+      while (i < items.length) {
+        const name = items[i].trim();
+        i++;
+        const vals: string[] = [];
+        while (i < items.length && !isTestName(items[i], items[i + 1])) {
+          vals.push(items[i].trim());
+          i++;
+        }
+        if (vals.length > 0) {
+          const val = vals[0];
+          const range = vals.find((v) => v.includes("–") || (v.includes("-") && v.length > 3)) ?? "";
+          const unitParts = vals.slice(1).filter((v) => !v.includes("–") && !(v.includes("-") && v.length > 3) && !isNum(v)).slice(0, 2);
+          rows.push({ name, val, unit: unitParts.join("/"), range });
+        }
+      }
+
+      if (rows.length > 1) {
+        return (
+          <div className="mt-1 max-h-44 overflow-y-auto">
+            <table className="w-full text-xs">
+              <tbody>
+                {rows.map((row, idx) => (
+                  <tr key={idx} className="border-b border-[color:var(--line)] last:border-0">
+                    <td className="py-1 pr-3 font-medium text-[var(--ink)]">{row.name}</td>
+                    <td className="py-1 pr-2 text-right font-semibold text-[var(--ink)]">{row.val}{row.unit ? ` ${row.unit}` : ""}</td>
+                    {row.range && <td className="py-1 text-right text-[var(--muted)]">{row.range}</td>}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        );
+      }
+    }
+    return <p className="mt-1 text-sm font-medium text-[var(--ink)]">{str}</p>;
+  };
+
+  return (
+    <div className={`rounded-[14px] border border-[color:var(--line)] bg-white px-3 py-2 ${isComplex ? "sm:col-span-2" : ""}`}>
+      <p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-[var(--muted)]">{label}</p>
+      {renderContent()}
     </div>
   );
 }
 
 function DetailChip({ label, value }: { label: string; value: string }) {
+  const isJson = value.startsWith("[") || value.startsWith("{");
   return (
-    <div className="rounded-[14px] border border-[color:var(--line)] bg-white px-3 py-2">
+    <div className={`rounded-[14px] border border-[color:var(--line)] bg-white px-3 py-2 ${isJson ? "sm:col-span-2" : ""}`}>
       <p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-[var(--muted)]">{label}</p>
-      <p className="mt-1 text-sm font-medium text-[var(--ink)]">{value}</p>
+      {isJson ? (
+        <pre className="mt-1 max-h-32 overflow-auto whitespace-pre-wrap break-all font-mono text-xs text-[var(--ink)]">{value}</pre>
+      ) : (
+        <p className="mt-1 text-sm font-medium text-[var(--ink)]">{value}</p>
+      )}
     </div>
   );
 }
