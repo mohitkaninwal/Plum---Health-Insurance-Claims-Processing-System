@@ -201,6 +201,9 @@ type EvalRun = {
     early_stop_accuracy?: number | null;
     approved_amount_exact_match_rate?: number | null;
     system_must_accuracy?: number | null;
+    rejection_reason_precision?: number | null;
+    rejection_reason_recall?: number | null;
+    rejection_reason_f1?: number | null;
   };
   cases: Array<{
     case_id: string;
@@ -1522,9 +1525,11 @@ export default function Home() {
               <div className="grid gap-3 sm:grid-cols-2">
                 {([
                   ["Decision accuracy", evalRun?.metrics.decision_accuracy, "Correct decision type out of all cases"],
-                  ["Early stop accuracy", evalRun?.metrics.early_stop_accuracy, "ACTION_REQUIRED correctly returned before adjudication"],
+                  ["Early stop accuracy", evalRun?.metrics.early_stop_accuracy, "ACTION_REQUIRED returned correctly before adjudication"],
                   ["Amount exact match", evalRun?.metrics.approved_amount_exact_match_rate, "Approved amount matches expected exactly"],
-                  ["System must accuracy", evalRun?.metrics.system_must_accuracy, "Behavioural requirements satisfied across all cases"]
+                  ["System must accuracy", evalRun?.metrics.system_must_accuracy, "All system_must behavioural requirements satisfied"],
+                  ["Rejection reason F1", evalRun?.metrics.rejection_reason_f1, "Label-level F1 on rejection reason codes (4 cases)"],
+                  ["Rejection reason precision", evalRun?.metrics.rejection_reason_precision, "Macro-avg precision over rejection label codes"],
                 ] as [string, number | null | undefined, string][]).map(([label, value, description]) => (
                   <div key={label} className="rounded-[18px] border border-[color:var(--line)] bg-[#fffaf2] p-4">
                     <p className="text-xs font-semibold uppercase tracking-[0.18em] text-[var(--muted)]">{label}</p>

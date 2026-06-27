@@ -254,6 +254,9 @@ class EvalMetrics(BaseModel):
     early_stop_accuracy: float | None = None
     approved_amount_exact_match_rate: float | None = None
     system_must_accuracy: float | None = None
+    rejection_reason_precision: float | None = None
+    rejection_reason_recall: float | None = None
+    rejection_reason_f1: float | None = None
 
 
 class EvalRun(BaseModel):
