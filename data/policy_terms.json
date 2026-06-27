@@ -291,6 +291,38 @@
       "gender": "M",
       "relationship": "CHILD",
       "primary_member_id": "EMP001"
+    },
+    {
+      "member_id": "DEP003",
+      "name": "Pooja Verma",
+      "date_of_birth": "1991-04-17",
+      "gender": "F",
+      "relationship": "SPOUSE",
+      "primary_member_id": "EMP003"
+    },
+    {
+      "member_id": "DEP004",
+      "name": "Rekha Patil",
+      "date_of_birth": "1978-09-03",
+      "gender": "F",
+      "relationship": "SPOUSE",
+      "primary_member_id": "EMP007"
+    },
+    {
+      "member_id": "DEP005",
+      "name": "Karan Patil",
+      "date_of_birth": "2010-02-21",
+      "gender": "M",
+      "relationship": "CHILD",
+      "primary_member_id": "EMP007"
+    },
+    {
+      "member_id": "DEP006",
+      "name": "Anjali Shah",
+      "date_of_birth": "1982-07-11",
+      "gender": "F",
+      "relationship": "SPOUSE",
+      "primary_member_id": "EMP010"
     }
   ]
 }

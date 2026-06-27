@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from datetime import date, datetime, timezone
 from enum import StrEnum
 from typing import Any
@@ -110,6 +112,14 @@ class ExtractedDocumentData(BaseModel):
     warnings: list[str] = Field(default_factory=list)
 
 
+class DocumentParseResult(BaseModel):
+    extracted_documents: list[ExtractedDocumentData] = Field(default_factory=list)
+    trace: list[TraceEvent] = Field(default_factory=list)
+    component_failures: list[ComponentFailure] = Field(default_factory=list)
+    member_action_required: MemberActionRequired | None = None
+    confidence_impact: float = 0
+
+
 class PolicyEvidence(BaseModel):
     evidence_id: str
     source: str
@@ -120,6 +130,33 @@ class PolicyEvidence(BaseModel):
     dense_score: float | None = None
     lexical_score: float | None = None
     rrf_score: float | None = None
+
+
+class PolicyMemberSummary(BaseModel):
+    member_id: str
+    name: str
+    relationship: str
+    join_date: date | None = None
+    primary_member_id: str | None = None
+    dependents: list[str] = Field(default_factory=list)
+
+
+class PolicyContext(BaseModel):
+    policy_id: str
+    policy_name: str
+    insurer: str
+    company_name: str
+    members: list[PolicyMemberSummary] = Field(default_factory=list)
+    unresolved_dependent_ids: list[str] = Field(default_factory=list)
+
+
+class MemberYtdSummary(BaseModel):
+    policy_id: str
+    member_id: str
+    as_of_date: date
+    ytd_claims_amount: float
+    claim_count: int
+    claim_ids: list[str] = Field(default_factory=list)
 
 
 class RuleCheckResult(BaseModel):

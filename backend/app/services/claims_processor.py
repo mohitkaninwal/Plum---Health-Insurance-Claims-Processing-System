@@ -123,6 +123,22 @@ def process_claim(submission: ClaimSubmission, policy: PolicyTerms | None = None
 
     member = _member_for(submission.member_id, policy)
     component_failures: list[ComponentFailure] = list(extraction_result.component_failures)
+    patient_name_reason = _patient_name_matches_member_family_reason(
+        submission,
+        member,
+        policy,
+        extraction_result.extracted_documents,
+    )
+    if patient_name_reason:
+        return _action_required_response(
+            submission,
+            trace,
+            evidence,
+            patient_name_reason,
+            code="PATIENT_MISMATCH",
+            component_failures=component_failures,
+            extracted_document_data=extraction_result.extracted_documents,
+        )
     confidence = _confidence_score(
         submission,
         evidence,
@@ -649,6 +665,64 @@ def _validate_documents(
     return None
 
 
+def _patient_name_matches_member_family_reason(
+    submission: ClaimSubmission,
+    member: PolicyMember | None,
+    policy: PolicyTerms,
+    extracted_documents: list[ExtractedDocumentData],
+) -> str | None:
+    observed_names = _observed_patient_names(submission, extracted_documents)
+    if not observed_names or member is None:
+        return None
+
+    allowed_names = _allowed_patient_names(member, policy)
+    if not allowed_names:
+        return None
+
+    unrecognized = [name for name in observed_names if _name_key(name) not in allowed_names]
+    if not unrecognized:
+        return None
+
+    allowed_display = sorted({_normalize_name(name) for name in allowed_names.values()})
+    return (
+        "Uploaded documents mention patient "
+        f"{', '.join(unrecognized)}, but the selected member {submission.member_id} only covers "
+        f"{', '.join(allowed_display)}."
+    )
+
+
+def _allowed_patient_names(member: PolicyMember, policy: PolicyTerms) -> dict[str, str]:
+    allowed: dict[str, str] = {_name_key(member.name): member.name}
+    members_by_id = {item.member_id: item for item in policy.members}
+
+    for dependent_id in member.dependents:
+        dependent = members_by_id.get(dependent_id)
+        if dependent is not None:
+            allowed[_name_key(dependent.name)] = dependent.name
+
+    for item in policy.members:
+        if item.primary_member_id == member.member_id:
+            allowed[_name_key(item.name)] = item.name
+
+    return allowed
+
+
+def _observed_patient_names(
+    submission: ClaimSubmission,
+    extracted_documents: list[ExtractedDocumentData],
+) -> list[str]:
+    names: list[str] = []
+    for document in submission.documents:
+        if document.patient_name_on_doc:
+            names.append(document.patient_name_on_doc)
+
+    for item in extracted_documents:
+        raw_name = item.fields.get("patient_name")
+        if isinstance(raw_name, str) and raw_name.strip():
+            names.append(raw_name.strip())
+    return _dedupe_names(names)
+
+
 def _approve_or_partially_approve(
     submission: ClaimSubmission, policy: PolicyTerms, confidence: float
 ) -> ClaimDecision:
@@ -1019,6 +1093,95 @@ def _member_for(member_id: str, policy: PolicyTerms) -> PolicyMember | None:
     return next((member for member in policy.members if member.member_id == member_id), None)
 
 
+def _action_required_response(
+    submission: ClaimSubmission,
+    trace: list[TraceEvent],
+    evidence: list[PolicyEvidence],
+    reason: str,
+    *,
+    code: str,
+    component_failures: list[ComponentFailure] | None = None,
+    extracted_document_data: list[ExtractedDocumentData] | None = None,
+    required_document_types: list[DocumentType] | None = None,
+) -> ClaimResponse:
+    affected_file_ids = [item.file_id for item in extracted_document_data or []] or [
+        document.file_id for document in submission.documents
+    ]
+    return ClaimResponse(
+        status=ClaimStatus.ACTION_REQUIRED,
+        submission=submission,
+        reason=reason,
+        member_action_required=MemberActionRequired(
+            code=code,
+            message=reason,
+            affected_file_ids=affected_file_ids,
+            required_document_types=required_document_types or [],
+        ),
+        trace=trace,
+        retrieved_policy_evidence=evidence,
+        component_failures=component_failures or [],
+        extracted_document_data=extracted_document_data or [],
+    )
+
+
+def _patient_name_matches_member_family_reason(
+    submission: ClaimSubmission,
+    member: PolicyMember | None,
+    policy: PolicyTerms,
+    extracted_documents: list[ExtractedDocumentData],
+) -> str | None:
+    observed_names = _observed_patient_names(submission, extracted_documents)
+    if not observed_names or member is None:
+        return None
+
+    allowed_names = _allowed_patient_names(member, policy)
+    if not allowed_names:
+        return None
+
+    unrecognized = [name for name in observed_names if _name_key(name) not in allowed_names]
+    if not unrecognized:
+        return None
+
+    allowed_display = ", ".join(sorted(allowed_names.values()))
+    return (
+        "Uploaded documents mention patient "
+        f"{', '.join(unrecognized)}, but the selected member {submission.member_id} only covers "
+        f"{allowed_display}."
+    )
+
+
+def _allowed_patient_names(member: PolicyMember, policy: PolicyTerms) -> dict[str, str]:
+    allowed: dict[str, str] = {_name_key(member.name): member.name}
+    members_by_id = {item.member_id: item for item in policy.members}
+
+    for dependent_id in member.dependents:
+        dependent = members_by_id.get(dependent_id)
+        if dependent is not None:
+            allowed[_name_key(dependent.name)] = dependent.name
+
+    for item in policy.members:
+        if item.primary_member_id == member.member_id:
+            allowed[_name_key(item.name)] = item.name
+
+    return allowed
+
+
+def _observed_patient_names(
+    submission: ClaimSubmission,
+    extracted_documents: list[ExtractedDocumentData],
+) -> list[str]:
+    names: list[str] = []
+    for document in submission.documents:
+        if document.patient_name_on_doc:
+            names.append(document.patient_name_on_doc)
+
+    for item in extracted_documents:
+        raw_name = item.fields.get("patient_name")
+        if isinstance(raw_name, str) and raw_name.strip():
+            names.append(raw_name.strip())
+    return _dedupe_preserve_order(names)
+
+
 def _policy_validity_reason(submission: ClaimSubmission, policy: PolicyTerms) -> str | None:
     holder = policy.policy_holder
     if holder.renewal_status.upper() != "ACTIVE":
@@ -1182,6 +1345,22 @@ def _hospital_name(submission: ClaimSubmission) -> str | None:
         if "hospital_name" in content:
             return str(content["hospital_name"])
     return None
+
+
+def _name_key(value: str) -> str:
+    return re.sub(r"\s+", " ", value).strip().casefold()
+
+
+def _dedupe_preserve_order(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        key = _name_key(value)
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(value)
+    return result
 
 
 def _policy_evidence(submission: ClaimSubmission, policy: PolicyTerms) -> list[PolicyEvidence]:

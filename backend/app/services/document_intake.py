@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+from datetime import date
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated
@@ -12,6 +13,7 @@ from fastapi import File, Form, UploadFile
 from app.core.config import settings
 from app.models import (
     ClaimCategory,
+    ClaimResponse,
     ClaimSubmission,
     DocumentClassification,
     DocumentQuality,
@@ -36,6 +38,32 @@ class UploadDocumentForm:
         treatment_date: Annotated[str, Form()],
         claimed_amount: Annotated[float, Form(gt=0)],
         files: Annotated[list[UploadFile], File(min_length=1)],
+        ytd_claims_amount: Annotated[float | None, Form()] = None,
+        hospital_name: Annotated[str | None, Form()] = None,
+        declared_types: Annotated[str | None, Form()] = None,
+        patient_names: Annotated[str | None, Form()] = None,
+    ) -> None:
+        self.member_id = member_id
+        self.policy_id = policy_id
+        self.claim_category = claim_category
+        self.treatment_date = treatment_date
+        self.claimed_amount = claimed_amount
+        self.files = files
+        self.ytd_claims_amount = ytd_claims_amount
+        self.hospital_name = hospital_name
+        self.declared_types = declared_types
+        self.patient_names = patient_names
+
+
+class ParseDocumentForm:
+    def __init__(
+        self,
+        files: Annotated[list[UploadFile], File(min_length=1)],
+        member_id: Annotated[str | None, Form()] = None,
+        policy_id: Annotated[str | None, Form()] = None,
+        claim_category: Annotated[ClaimCategory | None, Form()] = None,
+        treatment_date: Annotated[str | None, Form()] = None,
+        claimed_amount: Annotated[float | None, Form()] = None,
         ytd_claims_amount: Annotated[float | None, Form()] = None,
         hospital_name: Annotated[str | None, Form()] = None,
         declared_types: Annotated[str | None, Form()] = None,
@@ -122,6 +150,7 @@ async def submission_from_upload_form(form: UploadDocumentForm) -> ClaimSubmissi
                     "content_type": upload.content_type,
                     "size_bytes": len(content),
                     "sha256": hashlib.sha256(content).hexdigest(),
+                    "base64": base64.b64encode(content).decode("ascii"),
                 }
             },
         )
@@ -138,6 +167,64 @@ async def submission_from_upload_form(form: UploadDocumentForm) -> ClaimSubmissi
         documents=documents,
         ytd_claims_amount=form.ytd_claims_amount,
         hospital_name=form.hospital_name,
+    )
+
+
+async def submission_from_parse_form(form: ParseDocumentForm) -> ClaimSubmission:
+    declared_by_name = _document_type_map(form.declared_types)
+    patient_names_by_name = _string_map(form.patient_names)
+    documents: list[UploadedDocument] = []
+
+    for index, upload in enumerate(form.files, start=1):
+        content = await upload.read()
+        file_name = upload.filename or f"upload_{index}"
+        declared_type = declared_by_name.get(file_name) or declared_by_name.get(str(index))
+        patient_name = patient_names_by_name.get(file_name) or patient_names_by_name.get(str(index))
+        quality = DocumentQuality.UNREADABLE if not content else DocumentQuality.UNKNOWN
+        documents.append(
+            UploadedDocument(
+                file_id=f"UPL{index:03d}",
+                file_name=file_name,
+                declared_type=declared_type,
+                quality=quality,
+                patient_name_on_doc=patient_name,
+                content={
+                    "upload": {
+                        "content_type": upload.content_type,
+                        "size_bytes": len(content),
+                        "sha256": hashlib.sha256(content).hexdigest(),
+                        "base64": base64.b64encode(content).decode("ascii"),
+                    }
+                },
+            )
+        )
+
+    return ClaimSubmission(
+        member_id=form.member_id or "UNKNOWN_MEMBER",
+        policy_id=form.policy_id or "UNKNOWN_POLICY",
+        claim_category=form.claim_category or ClaimCategory.CONSULTATION,
+        treatment_date=form.treatment_date or date.today(),
+        claimed_amount=form.claimed_amount or 1,
+        documents=documents,
+        ytd_claims_amount=form.ytd_claims_amount,
+        hospital_name=form.hospital_name,
+    )
+
+
+def response_without_upload_payloads(response: ClaimResponse) -> ClaimResponse:
+    if response.submission is None:
+        return response
+
+    documents: list[UploadedDocument] = []
+    for document in response.submission.documents:
+        content = dict(document.content or {})
+        upload = content.get("upload")
+        if isinstance(upload, dict) and "base64" in upload:
+            content["upload"] = {key: value for key, value in upload.items() if key != "base64"}
+        documents.append(document.model_copy(update={"content": content}))
+
+    return response.model_copy(
+        update={"submission": response.submission.model_copy(update={"documents": documents})}
     )
 
 

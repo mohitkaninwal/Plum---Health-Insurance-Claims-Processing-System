@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import base64
+import io
+import json
+from datetime import datetime
 import re
 from typing import Any, NotRequired, TypedDict
 
@@ -19,6 +23,11 @@ from app.models import (
     UploadedDocument,
 )
 from app.services.document_intake import classify_document
+
+try:
+    from pypdf import PdfReader
+except Exception:  # pragma: no cover - dependency import guard
+    PdfReader = None
 
 
 class ExtractionPipelineResult(BaseModel):
@@ -114,6 +123,8 @@ def _vision_extraction_agent(state: _ExtractionState) -> _ExtractionState:
 
     for document, classification in zip(submission.documents, classifications, strict=False):
         data = _extract_from_fixture_content(document, classification.document_type)
+        if data is None:
+            data = _extract_from_uploaded_text(document, classification.document_type)
         if data is None:
             data, failure = _extract_with_groq(document, classification.document_type)
             if failure is not None:
@@ -232,13 +243,71 @@ def _extract_from_fixture_content(
     if not content or set(content) == {"upload"}:
         return None
 
-    missing_fields = _missing_fields(document_type, content)
+    fields = content.get("parsed_fields") if isinstance(content.get("parsed_fields"), dict) else content
+    normalized_fields = _normalize_fields(dict(fields))
+    if not normalized_fields:
+        return None
+
+    missing_fields = _missing_fields(document_type, normalized_fields)
     confidence = 0.92 if not missing_fields else max(0.65, 0.9 - 0.08 * len(missing_fields))
     warnings = [f"Missing {field}." for field in missing_fields]
     return ExtractedDocumentData(
         file_id=document.file_id,
         document_type=document_type,
-        fields=dict(content),
+        fields=normalized_fields,
+        missing_fields=missing_fields,
+        confidence=confidence,
+        warnings=warnings,
+    )
+
+
+def _extract_from_uploaded_text(
+    document: UploadedDocument, document_type: DocumentType
+) -> ExtractedDocumentData | None:
+    upload = (document.content or {}).get("upload", {})
+    content_base64 = upload.get("base64")
+    content_type = upload.get("content_type") or ""
+    if not content_base64:
+        return None
+
+    try:
+        content = base64.b64decode(content_base64)
+    except Exception:
+        return None
+
+    text = _uploaded_text(content, content_type, document.file_name or "")
+    if not text or not text.strip():
+        return None
+
+    parsed_fields = _parse_document_text(text, document_type)
+    if not parsed_fields:
+        return None
+
+    missing_fields = _missing_fields(document_type, parsed_fields)
+    if settings.groq_api_key and missing_fields:
+        try:
+            payload = _request_groq_text_extraction(document_type, text)
+            refined_fields = _normalize_fields(payload.fields)
+            if refined_fields:
+                parsed_fields = refined_fields
+                missing_fields = payload.missing_fields or _missing_fields(document_type, parsed_fields)
+                return ExtractedDocumentData(
+                    file_id=document.file_id,
+                    document_type=document_type,
+                    fields=parsed_fields,
+                    missing_fields=missing_fields,
+                    confidence=payload.confidence,
+                    warnings=payload.warnings,
+                )
+        except Exception:
+            pass
+
+    confidence = _parsed_text_confidence(document_type, parsed_fields, missing_fields)
+    warnings = [f"Missing {field}." for field in missing_fields]
+    return ExtractedDocumentData(
+        file_id=document.file_id,
+        document_type=document_type,
+        fields=parsed_fields,
         missing_fields=missing_fields,
         confidence=confidence,
         warnings=warnings,
@@ -289,6 +358,10 @@ def _request_groq_extraction(
         "matching this schema: fields object, missing_fields string array, confidence number "
         "between 0 and 1, warnings string array. Normalize patient_name, diagnosis, hospital_name, "
         "total, test_name, line_items, invoice_date, and pre_authorization_number when present. "
+        "invoice_date must be ISO YYYY-MM-DD. For Indian documents, interpret numeric dates as "
+        "DD/MM/YYYY unless impossible, so 03/11/2024 means 2024-11-03. For pharmacy bills, "
+        "line_items must include the medicine description and the row Amount total, not zero, "
+        "quantity, or MRP. Use NET AMOUNT or GRAND TOTAL for total when present. "
         f"The classified document_type is {document_type}."
     )
     response = client.chat.completions.create(
@@ -309,8 +382,8 @@ def _request_groq_extraction(
     )
     raw = response.choices[0].message.content or "{}"
     try:
-        return _LLMExtractionPayload.model_validate_json(raw)
-    except ValidationError:
+        return _parse_llm_extraction_payload(raw)
+    except (ValidationError, ValueError) as original_exc:
         repair = client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[
@@ -324,7 +397,96 @@ def _request_groq_extraction(
             ],
             temperature=0,
         )
-        return _LLMExtractionPayload.model_validate_json(repair.choices[0].message.content or "{}")
+        try:
+            return _parse_llm_extraction_payload(repair.choices[0].message.content or "{}")
+        except (ValidationError, ValueError) as repair_exc:
+            raise repair_exc from original_exc
+
+
+def _request_groq_text_extraction(document_type: DocumentType, text: str) -> _LLMExtractionPayload:
+    from groq import Groq
+
+    client = Groq(api_key=settings.groq_api_key)
+    prompt = (
+        "Extract structured health-insurance claim fields from this OCR text excerpt. Return only "
+        "JSON matching this schema: fields object, missing_fields string array, confidence number "
+        "between 0 and 1, warnings string array. Normalize patient_name, diagnosis, hospital_name, "
+        "total, test_name, line_items, invoice_date, and pre_authorization_number when present. "
+        "invoice_date must be ISO YYYY-MM-DD. For Indian documents, interpret numeric dates as "
+        "DD/MM/YYYY unless impossible, so 03/11/2024 means 2024-11-03. For pharmacy bills, "
+        "line_items must include the medicine description and the row Amount total, not zero, "
+        "quantity, or MRP. Use NET AMOUNT or GRAND TOTAL for total when present. "
+        f"The classified document_type is {document_type}. OCR text excerpt:\n{text[:12000]}"
+    )
+    response = client.chat.completions.create(
+        model="meta-llama/llama-4-scout-17b-16e-instruct",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0,
+    )
+    raw = response.choices[0].message.content or "{}"
+    try:
+        return _parse_llm_extraction_payload(raw)
+    except (ValidationError, ValueError) as original_exc:
+        repair = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[
+                {
+                    "role": "user",
+                    "content": (
+                        "Repair this into valid JSON only with keys fields, missing_fields, "
+                        f"confidence, warnings: {raw}"
+                    ),
+                }
+            ],
+            temperature=0,
+        )
+        try:
+            return _parse_llm_extraction_payload(repair.choices[0].message.content or "{}")
+        except (ValidationError, ValueError) as repair_exc:
+            raise repair_exc from original_exc
+
+
+def _parse_llm_extraction_payload(raw: str) -> _LLMExtractionPayload:
+    last_error: ValidationError | None = None
+    for candidate in _json_object_candidates(raw):
+        try:
+            return _LLMExtractionPayload.model_validate(candidate)
+        except ValidationError as exc:
+            last_error = exc
+    if last_error is not None:
+        raise last_error
+    raise ValueError("No JSON object was found in the LLM extraction response.")
+
+
+def _json_object_candidates(raw: str) -> list[dict[str, Any]]:
+    text = raw.strip()
+    candidates: list[dict[str, Any]] = []
+
+    try:
+        loaded = json.loads(text)
+        if isinstance(loaded, dict):
+            candidates.append(loaded)
+    except json.JSONDecodeError:
+        pass
+
+    decoder = json.JSONDecoder()
+    for match in re.finditer(r"\{", text):
+        try:
+            loaded, _ = decoder.raw_decode(text[match.start() :])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(loaded, dict):
+            candidates.append(loaded)
+
+    unique: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = json.dumps(candidate, sort_keys=True, default=str)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(candidate)
+    return unique
 
 
 def _empty_extraction(document: UploadedDocument, document_type: DocumentType) -> ExtractedDocumentData:
@@ -340,6 +502,311 @@ def _empty_extraction(document: UploadedDocument, document_type: DocumentType) -
         confidence=0.58 if fields else 0.5,
         warnings=["LLM/OCR extraction unavailable; preserved available local fields."],
     )
+
+
+def _uploaded_text(content: bytes, content_type: str, file_name: str) -> str | None:
+    content_type = content_type.lower()
+    file_name = file_name.lower()
+
+    if content_type.startswith("text/") or file_name.endswith(".txt"):
+        return content.decode("utf-8", errors="ignore")
+
+    if content_type.startswith("application/pdf") or file_name.endswith(".pdf"):
+        if PdfReader is None:
+            return None
+        try:
+            reader = PdfReader(io.BytesIO(content))
+            pages = [page.extract_text() or "" for page in reader.pages]
+        except Exception:
+            return None
+        text = "\n".join(page.strip() for page in pages if page and page.strip())
+        return text or None
+
+    return None
+
+
+def _parse_document_text(text: str, document_type: DocumentType) -> dict[str, Any]:
+    lines = [_normalize_whitespace(line) for line in text.splitlines()]
+    lines = [line for line in lines if line]
+    normalized_text = "\n".join(lines)
+    fields: dict[str, Any] = {}
+
+    patient_name = _extract_first_match(
+        normalized_text,
+        [
+            r"\bpatient(?:\s+name)?\b\s*[:\-]\s*(.+?)(?=\s{2,}|\bdate\b|\bage\b|\bgender\b|\bsex\b|$)",
+            r"\bname\b\s*[:\-]\s*(.+?)(?=\s{2,}|\bdate\b|\bage\b|\bgender\b|\bsex\b|$)",
+        ],
+    )
+    if patient_name:
+        fields["patient_name"] = patient_name
+
+    doctor_name = _extract_first_match(
+        normalized_text,
+        [
+            r"\b(?:ref(?:erring)?\s*)?(?:doctor|dr\.?)\b\s*[:\-]\s*(.+?)(?=\s{2,}|$)",
+            r"(?:^|\n)\s*(Dr\.[^\n,]+)",
+        ],
+    )
+    if doctor_name:
+        fields["doctor_name"] = doctor_name
+
+    hospital_name = _extract_hospital_name(lines)
+    if hospital_name:
+        fields["hospital_name"] = hospital_name
+
+    diagnosis = _extract_first_match(
+        normalized_text,
+        [
+            r"\b(?:primary\s+)?diagnosis\b\s*[:\-]\s*(.+?)(?=\s{2,}|$)",
+            r"\bimpression\b\s*[:\-]\s*(.+?)(?=\s{2,}|$)",
+            r"\bprovisional\s+diagnosis\b\s*[:\-]\s*(.+?)(?=\s{2,}|$)",
+        ],
+    )
+    if diagnosis:
+        fields["diagnosis"] = diagnosis
+
+    invoice_date = _extract_first_match(
+        normalized_text,
+        [
+            r"\b(?:invoice|bill|report|sample)\s+date\b\s*[:\-]\s*([0-9A-Za-z/\-]+)",
+            r"\bdate\b\s*[:\-]\s*([0-9A-Za-z/\-]+)",
+        ],
+    )
+    if invoice_date:
+        normalized_invoice_date = _normalize_date_value(invoice_date)
+        fields["invoice_date"] = normalized_invoice_date or invoice_date
+
+    bill_like_document = document_type in {
+        DocumentType.HOSPITAL_BILL,
+        DocumentType.PHARMACY_BILL,
+        DocumentType.DENTAL_REPORT,
+    }
+
+    total = None
+    if bill_like_document:
+        total = _extract_amount(
+            lines,
+            [
+                r"\b(?:net\s+amount|grand\s+total|total\s+amount|amount\s+due|bill\s+amount|invoice\s+total)\b",
+                r"\bsubtotal\b",
+            ],
+        )
+        if total is not None:
+            fields["total"] = total
+
+    tests = _extract_section_values(lines, ["investigations", "test name", "tests ordered", "tests"])
+    if tests:
+        fields["test_name"] = tests[0] if len(tests) == 1 else tests
+    elif document_type in {DocumentType.LAB_REPORT, DocumentType.DIAGNOSTIC_REPORT}:
+        parsed_tests = _parse_table_descriptions(lines)
+        if parsed_tests:
+            fields["test_name"] = parsed_tests[0] if len(parsed_tests) == 1 else parsed_tests
+
+    if bill_like_document:
+        line_items = _parse_line_items(lines)
+        if line_items:
+            fields["line_items"] = line_items
+            if total is None:
+                numeric_amounts = [
+                    item["amount"]
+                    for item in line_items
+                    if isinstance(item.get("amount"), (int, float))
+                ]
+                if numeric_amounts:
+                    fields["total"] = float(sum(float(amount) for amount in numeric_amounts))
+
+    return fields
+
+
+def _extract_first_match(text: str, patterns: list[str]) -> str | None:
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE | re.MULTILINE)
+        if not match:
+            continue
+        value = _clean_extracted_value(match.group(1))
+        if value:
+            return value
+    return None
+
+
+def _extract_hospital_name(lines: list[str]) -> str | None:
+    candidates: list[tuple[int, str]] = []
+    keywords = ("hospital", "clinic", "centre", "center", "diagnostic", "pharmacy", "lab", "laboratory")
+    for index, line in enumerate(lines[:10]):
+        lowered = line.lower()
+        if not any(keyword in lowered for keyword in keywords):
+            continue
+        if re.search(r"\b(patient|bill|invoice|report|date|total|gstin)\b", lowered):
+            continue
+        score = 0
+        if line == line.upper():
+            score += 2
+        if index == 0:
+            score += 1
+        if len(line) <= 80:
+            score += 1
+        candidates.append((score, line))
+    if not candidates:
+        return None
+    return max(candidates, key=lambda item: item[0])[1]
+
+
+def _extract_amount(lines: list[str], labels: list[str]) -> float | None:
+    for line in reversed(lines):
+        lowered = line.lower()
+        if not any(re.search(label, line, flags=re.IGNORECASE) for label in labels):
+            continue
+        numeric_candidates = _amount_candidates(line)
+        if numeric_candidates:
+            return float(numeric_candidates[-1])
+    return None
+
+
+def _extract_section_values(lines: list[str], headings: list[str]) -> list[str]:
+    values: list[str] = []
+    capture = False
+    heading_patterns = [heading.lower() for heading in headings]
+    for line in lines:
+        lowered = line.lower()
+        if any(heading in lowered for heading in heading_patterns):
+            after = re.split(r"[:\-]", line, maxsplit=1)
+            if len(after) > 1 and after[1].strip():
+                values.extend(_split_list_values(after[1].strip()))
+            capture = True
+            continue
+        if capture:
+            if re.search(r"\b(?:remarks?|summary|findings?|subtotal|total|amount)\b", lowered):
+                break
+            if not line:
+                break
+            values.extend(_split_list_values(line))
+    return _dedupe_preserve_order(values)
+
+
+def _parse_table_descriptions(lines: list[str]) -> list[str]:
+    descriptions: list[str] = []
+    for line in lines:
+        if re.search(r"\b(?:patient|bill|invoice|date|report|sample|subtotal|total|remarks?)\b", line, flags=re.IGNORECASE):
+            continue
+        chunks = re.split(r"\s{2,}", line.strip())
+        if len(chunks) < 2:
+            continue
+        if not re.fullmatch(r"(?:₹|INR|Rs\.?)?\s*[\d,]+(?:\.\d{1,2})?", chunks[-1], flags=re.IGNORECASE):
+            continue
+        description = _clean_extracted_value(chunks[0])
+        if description:
+            descriptions.append(description)
+    return _dedupe_preserve_order(descriptions)
+
+
+def _parse_line_items(lines: list[str]) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    for line in lines:
+        lowered = line.lower()
+        if re.search(r"\b(?:patient|bill|invoice|date|report|sample|subtotal|total|remarks?|gstin|age|gender|sex)\b", lowered):
+            continue
+        numeric_candidates = _amount_candidates(line)
+        if len(numeric_candidates) < 2:
+            continue
+        has_monetary_marker = bool(
+            re.search(r"(?:₹|inr|rs\.?)", line, flags=re.IGNORECASE)
+            or re.search(r"\b(?:amount|fee|charges?|charge|total|subtotal)\b", lowered)
+        )
+        if not has_monetary_marker and numeric_candidates[-1] != numeric_candidates[-2]:
+            continue
+        suffix_amount = numeric_candidates[-1]
+        description = _clean_extracted_value(
+            re.sub(r"(?:₹|inr|rs\.?)?\s*[\d,]+(?:\.\d{1,2})?\s*$", "", line, flags=re.IGNORECASE)
+        )
+        if not description:
+            continue
+        items.append({"description": description, "amount": suffix_amount})
+    return items
+
+
+def _split_list_values(raw: str) -> list[str]:
+    parts = [part.strip() for part in re.split(r",|/|;|\band\b", raw, flags=re.IGNORECASE) if part.strip()]
+    return [_clean_extracted_value(part) for part in parts if _clean_extracted_value(part)]
+
+
+def _dedupe_preserve_order(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        key = value.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(value)
+    return result
+
+
+def _normalize_whitespace(value: str) -> str:
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def _normalize_date_value(value: str) -> str | None:
+    cleaned = _normalize_whitespace(value)
+    formats = [
+        "%Y-%m-%d",
+        "%Y/%m/%d",
+        "%d-%m-%Y",
+        "%d/%m/%Y",
+        "%d-%b-%Y",
+        "%d-%B-%Y",
+        "%d %b %Y",
+        "%d %B %Y",
+    ]
+    for fmt in formats:
+        try:
+            return datetime.strptime(cleaned, fmt).date().isoformat()
+        except ValueError:
+            continue
+
+    match = re.search(r"\b(\d{4})[-/](\d{1,2})[-/](\d{1,2})\b", cleaned)
+    if match:
+        year, month, day = map(int, match.groups())
+        try:
+            return datetime(year, month, day).date().isoformat()
+        except ValueError:
+            return None
+
+    match = re.search(r"\b(\d{1,2})[-/](\d{1,2})[-/](\d{4})\b", cleaned)
+    if match:
+        day, month, year = map(int, match.groups())
+        try:
+            return datetime(year, month, day).date().isoformat()
+        except ValueError:
+            return None
+
+    return None
+
+
+def _amount_candidates(value: str) -> list[float]:
+    candidates: list[float] = []
+    for match in re.finditer(r"(?:₹|inr|rs\.?)?\s*([\d,]+(?:\.\d{1,2})?)", value, flags=re.IGNORECASE):
+        raw_value = match.group(1)
+        try:
+            candidates.append(float(raw_value.replace(",", "").strip()))
+        except ValueError:
+            continue
+    return candidates
+
+
+def _clean_extracted_value(value: str) -> str:
+    cleaned = _normalize_whitespace(value)
+    cleaned = re.sub(r"^[\s:,-]+|[\s:,-]+$", "", cleaned)
+    return cleaned
+
+
+def _parsed_text_confidence(
+    document_type: DocumentType, fields: dict[str, Any], missing_fields: list[str]
+) -> float:
+    required = len(_missing_fields(document_type, fields)) + len(fields)
+    base = 0.88 if required >= 3 else 0.76
+    penalty = min(0.22, 0.08 * len(missing_fields))
+    return max(0.55, base - penalty)
 
 
 def _normalize_extracted_data(data: ExtractedDocumentData) -> ExtractedDocumentData:
@@ -365,8 +832,12 @@ def _normalize_fields(fields: dict[str, Any]) -> dict[str, Any]:
     normalized: dict[str, Any] = {}
     for raw_key, value in fields.items():
         key = aliases.get(str(raw_key), _snake_case(str(raw_key)))
+        if key == "document_type":
+            continue
         if key == "patient_name" and value is not None:
             normalized[key] = re.sub(r"\s+", " ", str(value)).strip()
+        elif key in {"invoice_date", "treatment_date"} and value is not None:
+            normalized[key] = _normalize_date_value(str(value)) or str(value).strip()
         elif key in {"total", "amount"} and value is not None:
             normalized["total"] = _number_or_original(value)
         elif key == "line_items" and isinstance(value, list):
@@ -377,13 +848,22 @@ def _normalize_fields(fields: dict[str, Any]) -> dict[str, Any]:
 
 
 def _normalize_line_item(item: dict[str, Any]) -> dict[str, Any]:
-    description = item.get("description") or item.get("test_name") or item.get("procedure") or "Line item"
+    description = (
+        item.get("description")
+        or item.get("medicine_name")
+        or item.get("medicine")
+        or item.get("brand_name")
+        or item.get("item_name")
+        or item.get("test_name")
+        or item.get("procedure")
+        or "Line item"
+    )
     amount = item.get("amount") or item.get("total") or item.get("bill_amount") or 0
     return {"description": str(description), "amount": _number_or_original(amount)}
 
 
 def _number_or_original(value: Any) -> Any:
-    if isinstance(value, int | float):
+    if isinstance(value, (int, float)):
         return value
     try:
         return float(str(value).replace(",", "").replace("INR", "").strip())

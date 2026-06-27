@@ -1,7 +1,7 @@
 "use client";
 
 import Image from "next/image";
-import { startTransition, useEffect, useMemo, useState, type ReactNode } from "react";
+import { startTransition, useEffect, useRef, useState, type ReactNode } from "react";
 import {
   AlertCircle,
   ArrowLeft,
@@ -120,6 +120,67 @@ type ClaimResponse = {
   }>;
 };
 
+type PolicyContext = {
+  policy_id: string;
+  policy_name: string;
+  insurer: string;
+  company_name: string;
+  members: Array<{
+    member_id: string;
+    name: string;
+    relationship: string;
+    join_date?: string | null;
+    primary_member_id?: string | null;
+    dependents: string[];
+  }>;
+  unresolved_dependent_ids: string[];
+};
+
+type MemberYtdSummary = {
+  policy_id: string;
+  member_id: string;
+  as_of_date: string;
+  ytd_claims_amount: number;
+  claim_count: number;
+  claim_ids: string[];
+};
+
+type DocumentParseResponse = {
+  extracted_documents: Array<{
+    file_id: string;
+    document_type: DocumentType;
+    fields: Record<string, unknown>;
+    missing_fields: string[];
+    confidence: number;
+    warnings: string[];
+  }>;
+  trace?: Array<{
+    timestamp: string;
+    component: string;
+    level: "INFO" | "WARNING" | "ERROR";
+    message: string;
+    input_summary?: Record<string, unknown>;
+    output_summary?: Record<string, unknown>;
+    checks_performed?: string[];
+    evidence_ids?: string[];
+    confidence_impact?: number;
+    warnings?: string[];
+    errors?: string[];
+  }>;
+  component_failures?: Array<{
+    component: string;
+    message: string;
+    recoverable: boolean;
+  }>;
+  member_action_required?: {
+    code: string;
+    message: string;
+    affected_file_ids: string[];
+    required_document_types: DocumentType[];
+  } | null;
+  confidence_impact?: number;
+};
+
 type EvalRun = {
   eval_run_id: string;
   status: string;
@@ -153,6 +214,11 @@ type DocumentDraft = {
   declaredType: DocumentType;
   patientName: string;
   quality: "GOOD" | "LOW" | "UNREADABLE" | "UNKNOWN";
+  parsedDocumentType?: DocumentType | null;
+  parsedFields?: Record<string, unknown>;
+  parsedMissingFields?: string[];
+  parsedConfidence?: number | null;
+  parsedWarnings?: string[];
 };
 
 type ClaimDraft = {
@@ -168,250 +234,14 @@ type ClaimDraft = {
 
 const apiBaseUrl = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000";
 
-const demoCases: Array<{
-  id: string;
-  name: string;
-  category: ClaimCategory;
-  memberId: string;
-  amount: number;
-  note: string;
-  response: ClaimResponse;
-}> = [
-  {
-    id: "TC004",
-    name: "Clean consultation",
-    category: "CONSULTATION",
-    memberId: "EMP001",
-    amount: 1500,
-    note: "Approved with 10% co-pay, strong trace confidence, and full policy evidence.",
-    response: {
-      claim_id: "CLM_DEMO_004",
-      status: "COMPLETED",
-      decision: {
-        decision: "APPROVED",
-        approved_amount: 1350,
-        confidence_score: 0.92,
-        reason: "Consultation claim is covered, within limits, and co-pay was applied.",
-        rejection_reasons: [],
-        line_item_decisions: [
-          {
-            description: "Consultation fee",
-            claimed_amount: 1000,
-            approved_amount: 900,
-            decision: "ADJUSTED",
-            reason: "10% consultation co-pay applied."
-          },
-          {
-            description: "Diagnostics",
-            claimed_amount: 500,
-            approved_amount: 450,
-            decision: "ADJUSTED",
-            reason: "10% consultation co-pay applied."
-          }
-        ]
-      },
-      approved_amount: 1350,
-      confidence_score: 0.92,
-      reason: "Consultation claim is covered, within limits, and co-pay was applied.",
-      rejection_reasons: [],
-      line_item_decisions: [
-        {
-          description: "Consultation fee",
-          claimed_amount: 1000,
-          approved_amount: 900,
-          decision: "ADJUSTED",
-          reason: "10% consultation co-pay applied."
-        },
-        {
-          description: "Diagnostics",
-          claimed_amount: 500,
-          approved_amount: 450,
-          decision: "ADJUSTED",
-          reason: "10% consultation co-pay applied."
-        }
-      ],
-      extracted_document_data: [
-        {
-          file_id: "F007",
-          document_type: "PRESCRIPTION",
-          fields: {
-            doctor_name: "Dr. Arun Sharma",
-            patient_name: "Rajesh Kumar",
-            diagnosis: "Viral Fever"
-          },
-          missing_fields: [],
-          confidence: 0.95,
-          warnings: []
-        }
-      ],
-      trace: [
-        {
-          timestamp: new Date().toISOString(),
-          component: "DocumentClassifier",
-          level: "INFO",
-          message: "Documents classified for early intake validation.",
-          checks_performed: ["document_classification"]
-        },
-        {
-          timestamp: new Date().toISOString(),
-          component: "RuleEngine",
-          level: "INFO",
-          message: "Deterministic policy checks completed.",
-          output_summary: { decision: "APPROVED", approved_amount: 1350, confidence_score: 0.92 }
-        }
-      ],
-      retrieved_policy_evidence: [
-        {
-          evidence_id: "EVID_001",
-          source: "policy_terms.json",
-          rule_category: "co_pay",
-          claim_category: "CONSULTATION",
-          text: "Consultation claims attract a 10% co-pay."
-        },
-        {
-          evidence_id: "EVID_002",
-          source: "policy_terms.json",
-          rule_category: "coverage",
-          claim_category: "CONSULTATION",
-          text: "Consultation is a covered claim category."
-        }
-      ],
-      component_failures: []
-    }
-  },
-  {
-    id: "TC006",
-    name: "Dental partial approval",
-    category: "DENTAL",
-    memberId: "EMP002",
-    amount: 12000,
-    note: "Split decision showing line-item adjudication and rejection rationale.",
-    response: {
-      claim_id: "CLM_DEMO_006",
-      status: "COMPLETED",
-      decision: {
-        decision: "PARTIAL",
-        approved_amount: 8000,
-        confidence_score: 0.89,
-        reason: "Covered dental work approved; cosmetic whitening was excluded.",
-        rejection_reasons: ["COSMETIC_DENTAL_EXCLUSION"],
-        line_item_decisions: [
-          {
-            description: "Root canal treatment",
-            claimed_amount: 8000,
-            approved_amount: 8000,
-            decision: "APPROVED",
-            reason: "Covered under dental benefits."
-          },
-          {
-            description: "Teeth whitening",
-            claimed_amount: 4000,
-            approved_amount: 0,
-            decision: "REJECTED",
-            reason: "Cosmetic dental procedure is excluded."
-          }
-        ]
-      },
-      approved_amount: 8000,
-      confidence_score: 0.89,
-      reason: "Covered dental work approved; cosmetic whitening was excluded.",
-      rejection_reasons: ["COSMETIC_DENTAL_EXCLUSION"],
-      line_item_decisions: [
-        {
-          description: "Root canal treatment",
-          claimed_amount: 8000,
-          approved_amount: 8000,
-          decision: "APPROVED",
-          reason: "Covered under dental benefits."
-        },
-        {
-          description: "Teeth whitening",
-          claimed_amount: 4000,
-          approved_amount: 0,
-          decision: "REJECTED",
-          reason: "Cosmetic dental procedure is excluded."
-        }
-      ],
-      extracted_document_data: [
-        {
-          file_id: "F011",
-          document_type: "HOSPITAL_BILL",
-          fields: {
-            hospital_name: "Smile Dental Clinic",
-            patient_name: "Priya Singh"
-          },
-          missing_fields: [],
-          confidence: 0.91,
-          warnings: []
-        }
-      ],
-      trace: [
-        {
-          timestamp: new Date().toISOString(),
-          component: "RuleEngine",
-          level: "INFO",
-          message: "Line-item review completed."
-        }
-      ],
-      retrieved_policy_evidence: [
-        {
-          evidence_id: "EVID_010",
-          source: "policy_terms.json",
-          rule_category: "exclusions",
-          claim_category: "DENTAL",
-          text: "Cosmetic dental procedures are excluded."
-        }
-      ],
-      component_failures: []
-    }
-  },
-  {
-    id: "TC009",
-    name: "Fraud signal manual review",
-    category: "DIAGNOSTIC",
-    memberId: "EMP007",
-    amount: 25000,
-    note: "Manual review route with a visible warning state and confidence drop.",
-    response: {
-      claim_id: "CLM_DEMO_009",
-      status: "COMPLETED",
-      decision: {
-        decision: "MANUAL_REVIEW",
-        approved_amount: 0,
-        confidence_score: 0.67,
-        reason: "High-value claim matched fraud thresholds and needs manual review.",
-        rejection_reasons: [],
-        line_item_decisions: []
-      },
-      approved_amount: 0,
-      confidence_score: 0.67,
-      reason: "High-value claim matched fraud thresholds and needs manual review.",
-      rejection_reasons: [],
-      line_item_decisions: [],
-      extracted_document_data: [],
-      trace: [
-        {
-          timestamp: new Date().toISOString(),
-          component: "FraudSignalAgent",
-          level: "WARNING",
-          message: "Claim routed to manual review due to fraud signals.",
-          warnings: ["High-value claim matched threshold."]
-        }
-      ],
-      retrieved_policy_evidence: [],
-      component_failures: []
-    }
-  }
-];
-
 const defaultDraft: ClaimDraft = {
-  memberId: "EMP001",
-  policyId: "PLUM_GHI_2024",
+  memberId: "",
+  policyId: "",
   claimCategory: "CONSULTATION",
-  treatmentDate: "2024-11-01",
-  claimedAmount: "1500",
-  ytdClaimsAmount: "5000",
-  hospitalName: "City Clinic, Bengaluru",
+  treatmentDate: "",
+  claimedAmount: "",
+  ytdClaimsAmount: "",
+  hospitalName: "",
   documents: []
 };
 
@@ -419,23 +249,19 @@ export default function Home() {
   const [view, setView] = useState<ViewKey>("submit");
   const [navOverHero, setNavOverHero] = useState(true);
   const [draft, setDraft] = useState<ClaimDraft>(defaultDraft);
-  const [claimResponse, setClaimResponse] = useState<ClaimResponse>(demoCases[0].response);
+  const [claimResponse, setClaimResponse] = useState<ClaimResponse | null>(null);
+  const [parseResponse, setParseResponse] = useState<DocumentParseResponse | null>(null);
+  const [policyContext, setPolicyContext] = useState<PolicyContext | null>(null);
+  const [memberYtd, setMemberYtd] = useState<MemberYtdSummary | null>(null);
   const [hasReviewResult, setHasReviewResult] = useState(false);
   const [evalRun, setEvalRun] = useState<EvalRun | null>(null);
-  const [statusMessage, setStatusMessage] = useState<string>("Upload documents to start — details will be parsed automatically.");
+  const [statusMessage, setStatusMessage] = useState<string>("Upload documents to start.");
   const [loading, setLoading] = useState<"submit" | "eval" | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [selectedCaseId, setSelectedCaseId] = useState<string>(demoCases[0].id);
   const [submitStep, setSubmitStep] = useState<"upload" | "details">("upload");
   const [isDragging, setIsDragging] = useState(false);
-
-  const selectedDemo = useMemo(() => {
-    return demoCases.find((item) => item.id === selectedCaseId) ?? demoCases[0];
-  }, [selectedCaseId]);
-
-  useEffect(() => {
-    setClaimResponse(selectedDemo.response);
-  }, [selectedDemo]);
+  const parseRequestId = useRef(0);
+  const ytdRequestId = useRef(0);
 
   useEffect(() => {
     function syncNavbarTheme() {
@@ -451,6 +277,242 @@ export default function Home() {
     };
   }, []);
 
+  useEffect(() => {
+    let cancelled = false;
+    async function loadPolicyContext() {
+      try {
+        const result = await fetch(`${apiBaseUrl}/claims/context`);
+        if (!result.ok) {
+          throw new Error(`Failed to load policy context with status ${result.status}`);
+        }
+        const payload = (await result.json()) as PolicyContext;
+        if (cancelled) return;
+        setPolicyContext(payload);
+        setDraft((current) => ({
+          ...current,
+          policyId: payload.policy_id
+        }));
+      } catch (contextError) {
+        if (cancelled) return;
+        setError(contextError instanceof Error ? contextError.message : "Failed to load policy context");
+        setStatusMessage("Policy context could not be loaded.");
+      }
+    }
+
+    void loadPolicyContext();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!draft.memberId || !draft.treatmentDate || !policyContext?.policy_id) {
+      setMemberYtd(null);
+      setDraft((current) => ({ ...current, ytdClaimsAmount: "" }));
+      return;
+    }
+
+    const requestId = ytdRequestId.current + 1;
+    ytdRequestId.current = requestId;
+    setMemberYtd(null);
+
+    let cancelled = false;
+    async function loadMemberYtd() {
+      try {
+        const query = new URLSearchParams();
+        if (draft.treatmentDate) {
+          query.set("as_of_date", draft.treatmentDate);
+        }
+        const result = await fetch(
+          `${apiBaseUrl}/claims/members/${encodeURIComponent(draft.memberId)}/ytd${query.toString() ? `?${query.toString()}` : ""}`
+        );
+        if (!result.ok) {
+          throw new Error(`Failed to load YTD claims with status ${result.status}`);
+        }
+        const payload = (await result.json()) as MemberYtdSummary;
+        if (cancelled || ytdRequestId.current !== requestId) return;
+        setMemberYtd(payload);
+        setDraft((current) => ({ ...current, ytdClaimsAmount: String(payload.ytd_claims_amount) }));
+      } catch (ytdError) {
+        if (cancelled || ytdRequestId.current !== requestId) return;
+        setMemberYtd(null);
+        setDraft((current) => ({ ...current, ytdClaimsAmount: "0" }));
+      }
+    }
+
+    void loadMemberYtd();
+    return () => {
+      cancelled = true;
+    };
+  }, [draft.memberId, draft.treatmentDate, policyContext?.policy_id]);
+
+  function buildParseFormData(nextDraft: ClaimDraft): FormData {
+    const formData = new FormData();
+    if (nextDraft.memberId) formData.append("member_id", nextDraft.memberId);
+    if (nextDraft.policyId) formData.append("policy_id", nextDraft.policyId);
+    if (nextDraft.claimCategory) formData.append("claim_category", nextDraft.claimCategory);
+    if (nextDraft.treatmentDate) formData.append("treatment_date", nextDraft.treatmentDate);
+    if (nextDraft.claimedAmount) formData.append("claimed_amount", nextDraft.claimedAmount);
+    if (nextDraft.ytdClaimsAmount) formData.append("ytd_claims_amount", nextDraft.ytdClaimsAmount);
+    if (nextDraft.hospitalName) formData.append("hospital_name", nextDraft.hospitalName);
+
+    const declaredTypes: Record<string, DocumentType> = {};
+    const patientNames: Record<string, string> = {};
+
+    nextDraft.documents.forEach((document, index) => {
+      if (!document.file) return;
+      formData.append("files", document.file);
+      declaredTypes[document.file.name || `upload_${index + 1}`] = document.declaredType;
+      if (document.patientName) {
+        patientNames[document.file.name || `upload_${index + 1}`] = document.patientName;
+      }
+    });
+
+    if (Object.keys(declaredTypes).length > 0) {
+      formData.append("declared_types", JSON.stringify(declaredTypes));
+    }
+    if (Object.keys(patientNames).length > 0) {
+      formData.append("patient_names", JSON.stringify(patientNames));
+    }
+
+    return formData;
+  }
+
+  function applyParseResult(nextDraft: ClaimDraft, payload: DocumentParseResponse): ClaimDraft {
+    const documents = nextDraft.documents.map((document, index) => {
+      const parsed = payload.extracted_documents[index];
+      if (!parsed) return document;
+
+      const parsedPatientName =
+        typeof parsed.fields.patient_name === "string" ? parsed.fields.patient_name : "";
+      return {
+        ...document,
+        declaredType: parsed.document_type === "UNKNOWN" ? document.declaredType : parsed.document_type,
+        patientName: document.patientName || parsedPatientName,
+        parsedDocumentType: parsed.document_type,
+        parsedFields: parsed.fields,
+        parsedMissingFields: parsed.missing_fields,
+        parsedConfidence: parsed.confidence,
+        parsedWarnings: parsed.warnings
+      };
+    });
+
+    const firstParsedHospital = documents.find((doc) => {
+      const hospitalName = doc.parsedFields?.hospital_name;
+      return typeof hospitalName === "string" && hospitalName.trim().length > 0;
+    });
+    const firstParsedTotal = documents.find((doc) => {
+      const total = doc.parsedFields?.total;
+      return typeof total === "number" && Number.isFinite(total);
+    });
+    const firstParsedDate = documents.find((doc) => {
+      const invoiceDate = doc.parsedFields?.invoice_date;
+      return typeof invoiceDate === "string" && invoiceDate.trim().length > 0;
+    });
+    const suggestedClaimCategory = inferClaimCategoryFromDocuments(documents) ?? nextDraft.claimCategory;
+    const matchedMemberId = findMemberIdByPatientNames(
+      documents
+        .map((document) => document.patientName)
+        .filter((name): name is string => name.trim().length > 0)
+    );
+
+    return {
+      ...nextDraft,
+      documents,
+      memberId: nextDraft.memberId || matchedMemberId || "",
+      claimCategory: suggestedClaimCategory,
+      hospitalName:
+        nextDraft.hospitalName ||
+        (typeof firstParsedHospital?.parsedFields?.hospital_name === "string"
+          ? String(firstParsedHospital.parsedFields.hospital_name)
+          : ""),
+      claimedAmount:
+        typeof firstParsedTotal?.parsedFields?.total === "number"
+          ? String(firstParsedTotal.parsedFields.total)
+          : nextDraft.claimedAmount,
+      treatmentDate:
+        typeof firstParsedDate?.parsedFields?.invoice_date === "string"
+          ? String(firstParsedDate.parsedFields.invoice_date)
+          : nextDraft.treatmentDate
+    };
+  }
+
+  function findMemberIdByPatientNames(patientNames: string[]): string | null {
+    if (!policyContext?.members.length) return null;
+
+    const memberByName = new Map(
+      policyContext.members.map((member) => [normalizePersonName(member.name), member.member_id])
+    );
+    for (const patientName of patientNames) {
+      const memberId = memberByName.get(normalizePersonName(patientName));
+      if (memberId) return memberId;
+    }
+    return null;
+  }
+
+  function normalizePersonName(value: string): string {
+    return value.trim().replace(/\s+/g, " ").toLowerCase();
+  }
+
+  function formatMemberLabel(member: PolicyContext["members"][number]): string {
+    const relation = member.relationship.replace(/_/g, " ");
+    const primarySuffix = member.primary_member_id ? ` · ${member.primary_member_id}` : "";
+    return `${member.member_id} · ${member.name} · ${relation}${primarySuffix}`;
+  }
+
+  function inferClaimCategoryFromDocuments(documents: DocumentDraft[]): ClaimCategory | null {
+    const types = documents
+      .map((document) => document.parsedDocumentType ?? document.declaredType)
+      .filter((type): type is DocumentType => Boolean(type) && type !== "UNKNOWN");
+
+    if (types.includes("DENTAL_REPORT")) return "DENTAL";
+    if (types.includes("PHARMACY_BILL")) return "PHARMACY";
+    if (types.includes("LAB_REPORT") || types.includes("DIAGNOSTIC_REPORT")) return "DIAGNOSTIC";
+    if (types.includes("HOSPITAL_BILL") || types.includes("PRESCRIPTION") || types.includes("DISCHARGE_SUMMARY")) {
+      return "CONSULTATION";
+    }
+    return null;
+  }
+
+  async function parseUploadedDocuments(nextDraft: ClaimDraft) {
+    const files = nextDraft.documents.filter((doc) => doc.file);
+    if (!files.length) {
+      setParseResponse(null);
+      return;
+    }
+
+    const requestId = parseRequestId.current + 1;
+    parseRequestId.current = requestId;
+    setStatusMessage(`Parsing ${files.length} uploaded document${files.length > 1 ? "s" : ""}...`);
+
+    try {
+      const result = await fetch(`${apiBaseUrl}/claims/parse/upload`, {
+        method: "POST",
+        body: buildParseFormData(nextDraft)
+      });
+
+      if (!result.ok) {
+        throw new Error(`Parse request failed with status ${result.status}`);
+      }
+
+      const payload = (await result.json()) as DocumentParseResponse;
+      if (parseRequestId.current !== requestId) {
+        return;
+      }
+
+      setParseResponse(payload);
+      setDraft((current) => applyParseResult(current, payload));
+      setStatusMessage(`Parsed ${payload.extracted_documents.length} document${payload.extracted_documents.length > 1 ? "s" : ""}.`);
+    } catch (parseError) {
+      if (parseRequestId.current !== requestId) {
+        return;
+      }
+      setParseResponse(null);
+      setStatusMessage("Document parsing failed. You can still fill the form manually.");
+      setError(parseError instanceof Error ? parseError.message : "Document parsing failed");
+    }
+  }
+
   async function handleSubmitClaim() {
     setLoading("submit");
     setError(null);
@@ -458,65 +520,62 @@ export default function Home() {
 
     try {
       const hasFiles = draft.documents.some((doc) => doc.file);
-      let response: ClaimResponse;
-
-      if (hasFiles) {
-        const formData = new FormData();
-        formData.append("member_id", draft.memberId);
-        formData.append("policy_id", draft.policyId);
-        formData.append("claim_category", draft.claimCategory);
-        formData.append("treatment_date", draft.treatmentDate);
-        formData.append("claimed_amount", draft.claimedAmount);
-        if (draft.ytdClaimsAmount) formData.append("ytd_claims_amount", draft.ytdClaimsAmount);
-        if (draft.hospitalName) formData.append("hospital_name", draft.hospitalName);
-
-        const declaredTypes: Record<string, DocumentType> = {};
-        const patientNames: Record<string, string> = {};
-
-        draft.documents.forEach((document, index) => {
-          if (!document.file) return;
-          formData.append("files", document.file);
-          declaredTypes[document.file.name || `upload_${index + 1}`] = document.declaredType;
-          patientNames[document.file.name || `upload_${index + 1}`] = document.patientName;
-        });
-
-        formData.append("declared_types", JSON.stringify(declaredTypes));
-        formData.append("patient_names", JSON.stringify(patientNames));
-
-        const result = await fetch(`${apiBaseUrl}/claims/submit/upload`, {
-          method: "POST",
-          body: formData
-        });
-
-        if (!result.ok) throw new Error(`Upload submission failed with status ${result.status}`);
-        response = (await result.json()) as ClaimResponse;
-      } else {
-        const payload = {
-          member_id: draft.memberId,
-          policy_id: draft.policyId,
-          claim_category: draft.claimCategory,
-          treatment_date: draft.treatmentDate,
-          claimed_amount: Number(draft.claimedAmount),
-          ytd_claims_amount: draft.ytdClaimsAmount ? Number(draft.ytdClaimsAmount) : null,
-          hospital_name: draft.hospitalName || null,
-          documents: draft.documents.map((document, index) => ({
-            file_id: document.id.toUpperCase().replace(/[^A-Z0-9]/g, ""),
-            file_name: `${document.declaredType.toLowerCase()}_${index + 1}.jpg`,
-            actual_type: document.declaredType,
-            quality: document.quality,
-            patient_name_on_doc: document.patientName
-          }))
-        };
-
-        const result = await fetch(`${apiBaseUrl}/claims/submit`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload)
-        });
-
-        if (!result.ok) throw new Error(`Claim submission failed with status ${result.status}`);
-        response = (await result.json()) as ClaimResponse;
+      if (!hasFiles) {
+        throw new Error("Upload at least one document before submitting.");
       }
+
+      if (!draft.memberId || !draft.policyId || !draft.treatmentDate || !draft.claimedAmount) {
+        throw new Error("Fill member ID, policy ID, treatment date, and claimed amount before submitting.");
+      }
+
+      const documents: ApiDocument[] = draft.documents
+        .filter((document) => document.file)
+        .map((document, index) => {
+          const parsedFields = document.parsedFields ?? {};
+          const patientName = document.patientName || (typeof parsedFields.patient_name === "string" ? parsedFields.patient_name : "");
+          return {
+            file_id: `UPL${String(index + 1).padStart(3, "0")}`,
+            file_name: document.file?.name ?? null,
+            declared_type: document.parsedDocumentType && document.parsedDocumentType !== "UNKNOWN"
+              ? document.parsedDocumentType
+              : document.declaredType,
+            actual_type: document.parsedDocumentType && document.parsedDocumentType !== "UNKNOWN"
+              ? document.parsedDocumentType
+              : document.declaredType,
+            quality: document.quality,
+            patient_name_on_doc: patientName || null,
+            content: {
+              ...parsedFields,
+              parsed_fields: parsedFields,
+              parsed_document_type: document.parsedDocumentType ?? null,
+              parsed_confidence: document.parsedConfidence ?? null,
+              parsed_missing_fields: document.parsedMissingFields ?? [],
+              parsed_warnings: document.parsedWarnings ?? []
+            }
+          };
+        });
+
+      const payload = {
+        member_id: draft.memberId,
+        policy_id: draft.policyId,
+        claim_category: draft.claimCategory,
+        treatment_date: draft.treatmentDate,
+        claimed_amount: Number(draft.claimedAmount),
+        ytd_claims_amount: draft.ytdClaimsAmount ? Number(draft.ytdClaimsAmount) : undefined,
+        hospital_name: draft.hospitalName || undefined,
+        documents
+      };
+
+      const result = await fetch(`${apiBaseUrl}/claims/submit`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify(payload)
+      });
+
+      if (!result.ok) throw new Error(`Claim submission failed with status ${result.status}`);
+      const response = (await result.json()) as ClaimResponse;
 
       setClaimResponse(response);
       setHasReviewResult(true);
@@ -550,10 +609,20 @@ export default function Home() {
         file,
         declaredType: guessedType,
         patientName: "",
-        quality: "UNKNOWN"
+        quality: "UNKNOWN",
+        parsedDocumentType: null,
+        parsedFields: undefined,
+        parsedMissingFields: undefined,
+        parsedConfidence: null,
+        parsedWarnings: undefined
       };
     });
-    setDraft((current) => ({ ...current, documents: [...current.documents, ...newDocs] }));
+    const nextDraft = { ...draft, documents: [...draft.documents, ...newDocs] };
+    setDraft(nextDraft);
+    setClaimResponse(null);
+    setHasReviewResult(false);
+    setParseResponse(null);
+    void parseUploadedDocuments(nextDraft);
   }
 
   function handleDropZoneFiles(event: React.ChangeEvent<HTMLInputElement>) {
@@ -590,65 +659,14 @@ export default function Home() {
       setView("eval");
     } catch (evalError) {
       setError(evalError instanceof Error ? evalError.message : "Eval run failed");
-      setEvalRun({
-        eval_run_id: "EVAL_DEMO",
-        status: "COMPLETED",
-        started_at: new Date().toISOString(),
-        completed_at: new Date().toISOString(),
-        metrics: {
-          total_cases: 12,
-          completed_cases: 12,
-          decision_accuracy: 0.92,
-          early_stop_accuracy: 1,
-          approved_amount_exact_match_rate: 0.92,
-          reason_precision: 0.91,
-          reason_recall: 0.9,
-          reason_f1: 0.905,
-          retrieval_precision_at_k: 1,
-          retrieval_recall_at_k: 1
-        },
-        cases: demoCases.map((item) => ({
-          case_id: item.id,
-          case_name: item.name,
-          passed: true,
-          expected: {
-            decision: item.response.decision?.decision,
-            approved_amount: item.response.approved_amount
-          },
-          actual: item.response,
-          notes: [item.note]
-        }))
-      });
-      setStatusMessage("Showing demo eval results while the backend is unavailable.");
+      setEvalRun(null);
+      setStatusMessage("Eval run failed. Fix the issue and run again.");
       setView("eval");
     } finally {
       setLoading(null);
     }
   }
-
-  function loadDemoCase(caseId: string) {
-    const item = demoCases.find((caseItem) => caseItem.id === caseId) ?? demoCases[0];
-    setSelectedCaseId(caseId);
-    setClaimResponse(item.response);
-    setDraft((current) => ({
-      ...current,
-      memberId: item.memberId,
-      claimCategory: item.category,
-      claimedAmount: String(item.amount)
-    }));
-    setHasReviewResult(true);
-    setView("decision");
-    setStatusMessage(`Loaded ${item.id} into the review panel.`);
-  }
-
-  const activeDecision = claimResponse.decision ?? {
-    decision: "MANUAL_REVIEW" as DecisionType,
-    approved_amount: claimResponse.approved_amount ?? 0,
-    confidence_score: claimResponse.confidence_score ?? 0.72,
-    reason: claimResponse.reason ?? "Demo data loaded.",
-    rejection_reasons: claimResponse.rejection_reasons ?? [],
-    line_item_decisions: claimResponse.line_item_decisions ?? []
-  };
+  const activeDecision = claimResponse?.decision ?? null;
 
   function scrollToSection(targetView: ViewKey) {
     window.setTimeout(() => {
@@ -830,7 +848,7 @@ export default function Home() {
                     </p>
                     <p className="mt-1 text-sm text-[var(--muted)]">or click anywhere to browse · bills, prescriptions, lab reports, PDFs</p>
                     <p className="mt-3 text-xs text-[var(--muted)]">
-                      Document type is detected automatically from the filename
+                      Documents are parsed as soon as they are uploaded
                     </p>
                   </div>
 
@@ -851,8 +869,37 @@ export default function Home() {
                               {document.file ? document.file.name : `Fixture doc ${index + 1}`}
                             </p>
                             <p className="text-xs text-[var(--muted)]">
-                              {document.file ? `${(document.file.size / 1024).toFixed(0)} KB` : "No file · fixture mode"}
+                              {document.file ? `${(document.file.size / 1024).toFixed(0)} KB` : "No file"}
                             </p>
+                            <div className="mt-2 flex flex-wrap gap-2">
+                              <span className="rounded-full bg-[var(--plum)]/8 px-2 py-1 text-[10px] font-semibold uppercase tracking-[0.14em] text-[var(--plum)]">
+                                Parsed {document.parsedDocumentType ?? document.declaredType}
+                              </span>
+                              {typeof document.parsedConfidence === "number" ? (
+                                <span className="rounded-full bg-[#eef5ff] px-2 py-1 text-[10px] font-semibold uppercase tracking-[0.14em] text-[#3657a8]">
+                                  {Math.round(document.parsedConfidence * 100)}% confidence
+                                </span>
+                              ) : null}
+                            </div>
+                            {(document.parsedFields?.patient_name ||
+                              document.parsedFields?.hospital_name ||
+                              document.parsedFields?.diagnosis ||
+                              typeof document.parsedFields?.total !== "undefined") ? (
+                              <div className="mt-3 flex flex-wrap gap-2">
+                                {document.parsedFields?.patient_name ? (
+                                  <DetailChip label="patient" value={String(document.parsedFields.patient_name)} />
+                                ) : null}
+                                {document.parsedFields?.hospital_name ? (
+                                  <DetailChip label="hospital" value={String(document.parsedFields.hospital_name)} />
+                                ) : null}
+                                {document.parsedFields?.diagnosis ? (
+                                  <DetailChip label="diagnosis" value={String(document.parsedFields.diagnosis)} />
+                                ) : null}
+                                {typeof document.parsedFields?.total !== "undefined" ? (
+                                  <DetailChip label="total" value={String(document.parsedFields.total)} />
+                                ) : null}
+                              </div>
+                            ) : null}
                           </div>
                           {/* Type */}
                           <div className="flex flex-col gap-1">
@@ -893,10 +940,17 @@ export default function Home() {
                           {/* Remove */}
                           <button
                             type="button"
-                            onClick={() => setDraft((current) => ({
-                              ...current,
-                              documents: current.documents.filter((item) => item.id !== document.id)
-                            }))}
+                            onClick={() => {
+                              const nextDocuments = draft.documents.filter((item) => item.id !== document.id);
+                              const nextDraft = { ...draft, documents: nextDocuments };
+                              setDraft(nextDraft);
+                              setParseResponse(null);
+                              if (nextDocuments.some((doc) => doc.file)) {
+                                void parseUploadedDocuments(nextDraft);
+                              } else {
+                                parseRequestId.current += 1;
+                              }
+                            }}
                             className="mt-1 flex h-8 w-8 shrink-0 items-center justify-center rounded-full border border-[color:var(--line)] text-[var(--muted)] transition hover:border-[#dfb2a0] hover:text-[var(--ink)]"
                           >
                             <XCircle className="h-4 w-4" />
@@ -906,21 +960,10 @@ export default function Home() {
                     </div>
                   )}
 
-                  {/* Fixture mode helper */}
                   <div className="flex items-center justify-between gap-3">
                     <button
                       type="button"
-                      onClick={() => setDraft((current) => ({
-                        ...current,
-                        documents: [...current.documents, { id: `doc-${Date.now()}`, file: null, declaredType: "HOSPITAL_BILL", patientName: "", quality: "UNKNOWN" }]
-                      }))}
-                      className="text-xs font-medium text-[var(--muted)] underline-offset-2 hover:text-[var(--plum)] hover:underline"
-                    >
-                      + Add fixture document (no file, demo mode)
-                    </button>
-                    <button
-                      type="button"
-                      disabled={draft.documents.length === 0}
+                      disabled={draft.documents.length === 0 || !draft.documents.some((doc) => doc.file)}
                       onClick={() => setSubmitStep("details")}
                       className="inline-flex items-center gap-2 rounded-full bg-[var(--plum)] px-5 py-2.5 text-sm font-semibold text-white transition hover:opacity-95 disabled:cursor-not-allowed disabled:opacity-40"
                     >
@@ -950,22 +993,66 @@ export default function Home() {
                       <Sparkles className="mt-0.5 h-4 w-4 shrink-0 text-[#1f8f5c]" />
                       <div>
                         <p className="text-sm font-semibold text-[#166b44]">
-                          {draft.documents.filter((d) => d.file).length} document{draft.documents.filter((d) => d.file).length > 1 ? "s" : ""} uploaded — type detected automatically
+                          {draft.documents.filter((d) => d.file).length} document{draft.documents.filter((d) => d.file).length > 1 ? "s" : ""} uploaded — parsing runs on upload
                         </p>
                         <p className="mt-0.5 text-xs text-[#1f8f5c]">
-                          Full field extraction happens on submission. Verify the details below before submitting.
+                          Extracted fields are filled in as soon as the upload completes.
                         </p>
                       </div>
                     </div>
                   )}
 
+                  {draft.documents.some((d) => d.file) ? (
+                    <div className="rounded-[14px] border border-[color:var(--line)] bg-white p-3.5">
+                      <div className="flex items-center justify-between gap-3">
+                        <p className="text-sm font-semibold text-[var(--ink)]">Parse status</p>
+                        <span className="text-xs font-semibold uppercase tracking-[0.16em] text-[var(--muted)]">
+                          {parseResponse ? "Parsed" : "Waiting"}
+                        </span>
+                      </div>
+                      <p className="mt-2 text-sm leading-6 text-[var(--muted)]">
+                        {parseResponse
+                          ? `Extracted ${parseResponse.extracted_documents.length} document${parseResponse.extracted_documents.length > 1 ? "s" : ""} from the latest upload.`
+                          : "The latest upload will be parsed automatically and the extracted values will populate the fields below."}
+                      </p>
+                      {parseResponse?.component_failures?.length ? (
+                        <p className="mt-2 text-xs text-[#9c3b34]">
+                          {parseResponse.component_failures.map((item) => item.message).join(" · ")}
+                        </p>
+                      ) : null}
+                    </div>
+                  ) : null}
+
                   {/* Form */}
                   <div className="grid gap-4 md:grid-cols-2">
-                    <Field label="Member ID">
-                      <input value={draft.memberId} onChange={(e) => setDraft((c) => ({ ...c, memberId: e.target.value }))} className="field" placeholder="EMP001" />
-                    </Field>
                     <Field label="Policy ID">
-                      <input value={draft.policyId} onChange={(e) => setDraft((c) => ({ ...c, policyId: e.target.value }))} className="field" placeholder="PLUM_GHI_2024" />
+                      <input value={policyContext?.policy_id ?? draft.policyId} readOnly className="field bg-[#f7f1ea] text-[var(--muted)]" />
+                    </Field>
+                    <Field label="Member">
+                      <select
+                        value={draft.memberId}
+                        onChange={(e) => setDraft((c) => ({ ...c, memberId: e.target.value }))}
+                        className="field"
+                        disabled={!policyContext?.members.length}
+                      >
+                        {policyContext?.members.length ? (
+                          <>
+                            <option value="">Select member</option>
+                            {policyContext.members.map((member) => (
+                              <option key={member.member_id} value={member.member_id}>
+                                {formatMemberLabel(member)}
+                              </option>
+                            ))}
+                          </>
+                        ) : (
+                          <option value="">Loading members...</option>
+                        )}
+                      </select>
+                      {policyContext?.unresolved_dependent_ids?.length ? (
+                        <p className="mt-2 text-xs text-[#9f5f17]">
+                          Policy references uncovered dependent IDs: {policyContext.unresolved_dependent_ids.join(", ")}
+                        </p>
+                      ) : null}
                     </Field>
                     <Field label="Claim category">
                       <select value={draft.claimCategory} onChange={(e) => setDraft((c) => ({ ...c, claimCategory: e.target.value as ClaimCategory }))} className="field">
@@ -981,7 +1068,20 @@ export default function Home() {
                       <input type="number" min="1" value={draft.claimedAmount} onChange={(e) => setDraft((c) => ({ ...c, claimedAmount: e.target.value }))} className="field" />
                     </Field>
                     <Field label="Year-to-date amount">
-                      <input type="number" min="0" value={draft.ytdClaimsAmount} onChange={(e) => setDraft((c) => ({ ...c, ytdClaimsAmount: e.target.value }))} className="field" placeholder="Optional" />
+                      <input
+                        type="number"
+                        min="0"
+                        value={draft.ytdClaimsAmount}
+                        readOnly
+                        className="field bg-[#f7f1ea] text-[var(--muted)]"
+                        placeholder={
+                          draft.memberId && draft.treatmentDate
+                            ? memberYtd
+                              ? "Loaded from claims history"
+                              : "Loading..."
+                            : "Select member and treatment date"
+                        }
+                      />
                     </Field>
                     <Field label="Hospital name">
                       <input value={draft.hospitalName} onChange={(e) => setDraft((c) => ({ ...c, hospitalName: e.target.value }))} className="field" placeholder="Optional" />
@@ -998,7 +1098,7 @@ export default function Home() {
                         </div>
                         <div className="min-w-0 flex-1">
                           <p className="truncate text-xs font-medium text-[var(--ink)]">
-                            {document.file ? document.file.name : `Fixture · ${document.declaredType.replace(/_/g, " ")}`}
+                            {document.file ? document.file.name : "Uploaded document"}
                           </p>
                         </div>
                         <input
@@ -1022,7 +1122,15 @@ export default function Home() {
                     <button
                       type="button"
                       onClick={() => startTransition(() => handleSubmitClaim())}
-                      disabled={loading === "submit"}
+                      disabled={
+                        loading === "submit" ||
+                        !draft.documents.some((doc) => doc.file) ||
+                        !draft.memberId ||
+                        !draft.policyId ||
+                        !draft.treatmentDate ||
+                        !draft.claimedAmount ||
+                        !memberYtd
+                      }
                       className="inline-flex items-center justify-center gap-2 rounded-full bg-[var(--plum)] px-5 py-3 text-sm font-semibold text-white transition hover:opacity-95 disabled:cursor-not-allowed disabled:opacity-70"
                     >
                       {loading === "submit" ? <Loader2 className="h-4 w-4 animate-spin" /> : <UploadCloud className="h-4 w-4" />}
@@ -1035,188 +1143,210 @@ export default function Home() {
           </div>
 
           <div className={view === "decision" ? "space-y-6" : "hidden"}>
-            <Panel title="Decision review" icon={<BadgeCheck className="h-4 w-4" />}>
-              <div className="grid gap-4 md:grid-cols-[0.78fr_1.22fr]">
-                <div className="rounded-[22px] border border-[color:var(--line)] bg-[linear-gradient(180deg,#1d0716,#351325)] p-5 text-white">
-                  <p className="text-xs font-semibold uppercase tracking-[0.18em] text-[#fff1e5]/60">
-                    Final decision
-                  </p>
-                  <div className="mt-4 flex items-center gap-3">
-                    <DecisionBadge decision={activeDecision.decision} />
-                    <div>
-                      <div className="text-3xl font-semibold tracking-[-0.03em]">
-                        INR {activeDecision.approved_amount.toLocaleString("en-IN")}
-                      </div>
-                      <p className="text-sm text-[#fff1e5]/70">Approved amount</p>
-                    </div>
-                  </div>
-                  <div className="mt-5 rounded-[18px] border border-white/10 bg-white/5 p-4">
-                    <p className="text-xs font-semibold uppercase tracking-[0.18em] text-[#fff1e5]/60">
-                      Confidence
-                    </p>
-                    <div className="mt-3 flex items-end gap-3">
-                      <div className="text-3xl font-semibold">
-                        {Math.round((activeDecision.confidence_score ?? 0) * 100)}%
-                      </div>
-                      <div className="flex-1">
-                        <div className="h-2 overflow-hidden rounded-full bg-white/10">
-                          <div
-                            className="h-full rounded-full bg-[#ffb591]"
-                            style={{ width: `${Math.round((activeDecision.confidence_score ?? 0) * 100)}%` }}
-                          />
+            {claimResponse ? (
+              <>
+                <Panel title="Decision review" icon={<BadgeCheck className="h-4 w-4" />}>
+                  {activeDecision ? (
+                    <div className="grid gap-4 md:grid-cols-[0.78fr_1.22fr]">
+                      <div className="rounded-[22px] border border-[color:var(--line)] bg-[linear-gradient(180deg,#1d0716,#351325)] p-5 text-white">
+                        <p className="text-xs font-semibold uppercase tracking-[0.18em] text-[#fff1e5]/60">
+                          Final decision
+                        </p>
+                        <div className="mt-4 flex items-center gap-3">
+                          <DecisionBadge decision={activeDecision.decision} />
+                          <div>
+                            <div className="text-3xl font-semibold tracking-[-0.03em]">
+                              INR {activeDecision.approved_amount.toLocaleString("en-IN")}
+                            </div>
+                            <p className="text-sm text-[#fff1e5]/70">Approved amount</p>
+                          </div>
                         </div>
-                      </div>
-                    </div>
-                  </div>
-                </div>
-
-                <div className="space-y-4">
-                  <SummaryRow label="Reason" value={activeDecision.reason} />
-                  <SummaryRow
-                    label="Member action required"
-                    value={claimResponse.member_action_required?.message ?? "None"}
-                  />
-                  <SummaryRow
-                    label="Rejection reasons"
-                    value={claimResponse.rejection_reasons?.length ? claimResponse.rejection_reasons.join(", ") : "None"}
-                  />
-                  <SummaryRow
-                    label="Warnings"
-                    value={claimResponse.component_failures?.length ? claimResponse.component_failures.map((item) => item.message).join(" · ") : "No component failures"}
-                  />
-                </div>
-              </div>
-            </Panel>
-
-            <Panel title="Document validation and extraction" icon={<FileText className="h-4 w-4" />}>
-              <div className="grid gap-4">
-                {(claimResponse.extracted_document_data?.length ?? 0) > 0 ? (
-                  claimResponse.extracted_document_data?.map((doc) => (
-                    <div key={doc.file_id} className="rounded-[18px] border border-[color:var(--line)] bg-[#fffaf2] p-4">
-                      <div className="flex flex-wrap items-center justify-between gap-2">
-                        <div>
-                          <p className="text-sm font-semibold text-[var(--ink)]">
-                            {doc.file_id} · {doc.document_type}
+                        <div className="mt-5 rounded-[18px] border border-white/10 bg-white/5 p-4">
+                          <p className="text-xs font-semibold uppercase tracking-[0.18em] text-[#fff1e5]/60">
+                            Confidence
                           </p>
-                          <p className="text-xs text-[var(--muted)]">Confidence {Math.round(doc.confidence * 100)}%</p>
+                          <div className="mt-3 flex items-end gap-3">
+                            <div className="text-3xl font-semibold">
+                              {Math.round((activeDecision.confidence_score ?? 0) * 100)}%
+                            </div>
+                            <div className="flex-1">
+                              <div className="h-2 overflow-hidden rounded-full bg-white/10">
+                                <div
+                                  className="h-full rounded-full bg-[#ffb591]"
+                                  style={{ width: `${Math.round((activeDecision.confidence_score ?? 0) * 100)}%` }}
+                                />
+                              </div>
+                            </div>
+                          </div>
                         </div>
-                        <span className="rounded-full bg-white px-3 py-1 text-xs font-semibold text-[var(--muted)]">
-                          {doc.missing_fields.length ? `${doc.missing_fields.length} missing fields` : "Complete"}
-                        </span>
                       </div>
-                      <div className="mt-4 grid gap-3 sm:grid-cols-2">
-                        {Object.entries(doc.fields).map(([key, value]) => (
-                          <DetailChip key={key} label={key} value={String(value)} />
-                        ))}
-                      </div>
-                    </div>
-                  ))
-                ) : (
-                  <EmptyState title="No extraction data" body="The current claim response does not include extracted fields yet." />
-                )}
-              </div>
-            </Panel>
 
-            <Panel title="Line-item adjudication" icon={<Layers3 className="h-4 w-4" />}>
-              <div className="space-y-3">
-                {activeDecision.line_item_decisions.length ? (
-                  activeDecision.line_item_decisions.map((item) => (
-                    <div key={`${item.description}-${item.claimed_amount}`} className="grid gap-3 rounded-[18px] border border-[color:var(--line)] bg-white p-4 md:grid-cols-[1.3fr_0.5fr_0.5fr_0.6fr]">
-                      <div>
-                        <p className="font-medium text-[var(--ink)]">{item.description}</p>
-                        <p className="mt-1 text-sm text-[var(--muted)]">{item.reason}</p>
-                      </div>
-                      <DetailChip label="Claimed" value={`INR ${item.claimed_amount.toLocaleString("en-IN")}`} />
-                      <DetailChip label="Approved" value={`INR ${item.approved_amount.toLocaleString("en-IN")}`} />
-                      <div className="flex items-center justify-start md:justify-end">
-                        <LineBadge decision={item.decision} />
+                      <div className="space-y-4">
+                        <SummaryRow label="Reason" value={activeDecision.reason} />
+                        <SummaryRow
+                          label="Member action required"
+                          value={claimResponse.member_action_required?.message ?? "None"}
+                        />
+                        <SummaryRow
+                          label="Rejection reasons"
+                          value={claimResponse.rejection_reasons?.length ? claimResponse.rejection_reasons.join(", ") : "None"}
+                        />
+                        <SummaryRow
+                          label="Warnings"
+                          value={claimResponse.component_failures?.length ? claimResponse.component_failures.map((item) => item.message).join(" · ") : "No component failures"}
+                        />
                       </div>
                     </div>
-                  ))
-                ) : (
-                  <EmptyState title="No line items" body="This claim has no itemized approvals or rejections." />
-                )}
-              </div>
-            </Panel>
+                  ) : (
+                    <EmptyState title="No final decision" body={claimResponse.reason ?? "The claim needs more information before a decision can be shown."} />
+                  )}
+                </Panel>
+
+                <Panel title="Document validation and extraction" icon={<FileText className="h-4 w-4" />}>
+                  <div className="grid gap-4">
+                    {(claimResponse.extracted_document_data?.length ?? 0) > 0 ? (
+                      claimResponse.extracted_document_data?.map((doc) => (
+                        <div key={doc.file_id} className="rounded-[18px] border border-[color:var(--line)] bg-[#fffaf2] p-4">
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <div>
+                              <p className="text-sm font-semibold text-[var(--ink)]">
+                                {doc.file_id} · {doc.document_type}
+                              </p>
+                              <p className="text-xs text-[var(--muted)]">Confidence {Math.round(doc.confidence * 100)}%</p>
+                            </div>
+                            <span className="rounded-full bg-white px-3 py-1 text-xs font-semibold text-[var(--muted)]">
+                              {doc.missing_fields.length ? `${doc.missing_fields.length} missing fields` : "Complete"}
+                            </span>
+                          </div>
+                          <div className="mt-4 grid gap-3 sm:grid-cols-2">
+                            {Object.entries(doc.fields).map(([key, value]) => (
+                              <DetailChip key={key} label={key} value={String(value)} />
+                            ))}
+                          </div>
+                        </div>
+                      ))
+                    ) : (
+                      <EmptyState title="No extraction data" body="The current claim response does not include extracted fields yet." />
+                    )}
+                  </div>
+                </Panel>
+
+                <Panel title="Line-item adjudication" icon={<Layers3 className="h-4 w-4" />}>
+                  <div className="space-y-3">
+                    {activeDecision ? (
+                      activeDecision.line_item_decisions.length ? (
+                        activeDecision.line_item_decisions.map((item) => (
+                          <div key={`${item.description}-${item.claimed_amount}`} className="grid gap-3 rounded-[18px] border border-[color:var(--line)] bg-white p-4 md:grid-cols-[1.3fr_0.5fr_0.5fr_0.6fr]">
+                            <div>
+                              <p className="font-medium text-[var(--ink)]">{item.description}</p>
+                              <p className="mt-1 text-sm text-[var(--muted)]">{item.reason}</p>
+                            </div>
+                            <DetailChip label="Claimed" value={`INR ${item.claimed_amount.toLocaleString("en-IN")}`} />
+                            <DetailChip label="Approved" value={`INR ${item.approved_amount.toLocaleString("en-IN")}`} />
+                            <div className="flex items-center justify-start md:justify-end">
+                              <LineBadge decision={item.decision} />
+                            </div>
+                          </div>
+                        ))
+                      ) : (
+                        <EmptyState title="No line items" body="This claim has no itemized approvals or rejections." />
+                      )
+                    ) : (
+                      <EmptyState title="No line items" body="The claim has not produced line-item adjudication yet." />
+                    )}
+                  </div>
+                </Panel>
+              </>
+            ) : (
+              <EmptyState title="No claim submitted yet" body="Upload a document and submit a claim to populate the review panels." />
+            )}
           </div>
         </section>
         ) : null}
 
         {view === "decision" ? (
         <section className="grid scroll-mt-32 gap-6 xl:grid-cols-[0.92fr_1.08fr]">
-          <Panel title="Trace timeline" icon={<Clock3 className="h-4 w-4" />}>
-            <div className="space-y-3">
-              {(claimResponse.trace?.length ?? 0) > 0 ? (
-                claimResponse.trace?.map((event, index) => (
-                  <div key={`${event.component}-${index}`} className="flex gap-4 rounded-[18px] border border-[color:var(--line)] bg-[#fffaf2] p-4">
-                    <div className="mt-1 flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-[var(--plum)] text-xs font-semibold text-white">
-                      {index + 1}
-                    </div>
-                    <div className="min-w-0 flex-1">
-                      <div className="flex flex-wrap items-center gap-2">
-                        <p className="font-semibold text-[var(--ink)]">{event.component}</p>
-                        <span className={`rounded-full px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.15em] ${
-                          event.level === "WARNING"
-                            ? "bg-[#fff1db] text-[#9f5f17]"
-                            : event.level === "ERROR"
-                              ? "bg-[#ffe0dd] text-[#a83d35]"
-                              : "bg-[#e7f4ee] text-[#1f8f5c]"
-                        }`}>
-                          {event.level}
-                        </span>
+          {claimResponse ? (
+            <>
+              <Panel title="Trace timeline" icon={<Clock3 className="h-4 w-4" />}>
+                <div className="space-y-3">
+                  {(claimResponse.trace?.length ?? 0) > 0 ? (
+                    claimResponse.trace?.map((event, index) => (
+                      <div key={`${event.component}-${index}`} className="flex gap-4 rounded-[18px] border border-[color:var(--line)] bg-[#fffaf2] p-4">
+                        <div className="mt-1 flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-[var(--plum)] text-xs font-semibold text-white">
+                          {index + 1}
+                        </div>
+                        <div className="min-w-0 flex-1">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <p className="font-semibold text-[var(--ink)]">{event.component}</p>
+                            <span className={`rounded-full px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.15em] ${
+                              event.level === "WARNING"
+                                ? "bg-[#fff1db] text-[#9f5f17]"
+                                : event.level === "ERROR"
+                                  ? "bg-[#ffe0dd] text-[#a83d35]"
+                                  : "bg-[#e7f4ee] text-[#1f8f5c]"
+                            }`}>
+                              {event.level}
+                            </span>
+                          </div>
+                          <p className="mt-1 text-sm leading-6 text-[var(--muted)]">{event.message}</p>
+                        </div>
                       </div>
-                      <p className="mt-1 text-sm leading-6 text-[var(--muted)]">{event.message}</p>
-                    </div>
-                  </div>
-                ))
-              ) : (
-                <EmptyState title="No trace yet" body="Run a submission to populate the trace timeline." />
-              )}
-            </div>
-          </Panel>
+                    ))
+                  ) : (
+                    <EmptyState title="No trace yet" body="Run a submission to populate the trace timeline." />
+                  )}
+                </div>
+              </Panel>
 
-          <Panel title="Policy evidence and warnings" icon={<Hospital className="h-4 w-4" />}>
-            <div className="grid gap-4 lg:grid-cols-2">
-              <div className="space-y-3">
-                {(claimResponse.retrieved_policy_evidence?.length ?? 0) > 0 ? (
-                  claimResponse.retrieved_policy_evidence?.map((evidence) => (
-                    <div key={evidence.evidence_id} className="rounded-[18px] border border-[color:var(--line)] bg-[#fffaf2] p-4">
-                      <div className="flex items-center justify-between gap-3">
-                        <p className="font-semibold text-[var(--ink)]">{evidence.rule_category}</p>
-                        <span className="rounded-full bg-white px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.15em] text-[var(--muted)]">
-                          {evidence.source}
-                        </span>
-                      </div>
-                      <p className="mt-3 text-sm leading-6 text-[var(--muted)]">{evidence.text}</p>
-                    </div>
-                  ))
-                ) : (
-                  <EmptyState title="No policy evidence" body="The response did not include retrieved evidence." />
-                )}
-              </div>
-              <div className="space-y-3">
-                {(claimResponse.component_failures?.length ?? 0) > 0 ? (
-                  claimResponse.component_failures?.map((failure) => (
-                    <div key={`${failure.component}-${failure.message}`} className="rounded-[18px] border border-[#f1c4c0] bg-[#fff1f1] p-4">
-                      <div className="flex items-center gap-2">
-                        <AlertCircle className="h-4 w-4 text-[#a83d35]" />
-                        <p className="font-semibold text-[#7f241d]">{failure.component}</p>
-                      </div>
-                      <p className="mt-2 text-sm leading-6 text-[#9c3b34]">{failure.message}</p>
-                    </div>
-                  ))
-                ) : (
-                  <EmptyState title="No component failures" body="Warnings and recoverable failures appear here when present." />
-                )}
-                {claimResponse.member_action_required ? (
-                  <div className="rounded-[18px] border border-[#f5cfb8] bg-[#fff4eb] p-4">
-                    <p className="text-sm font-semibold text-[#9f5f17]">Member action required</p>
-                    <p className="mt-2 text-sm leading-6 text-[#a06a2a]">{claimResponse.member_action_required.message}</p>
+              <Panel title="Policy evidence and warnings" icon={<Hospital className="h-4 w-4" />}>
+                <div className="grid gap-4 lg:grid-cols-2">
+                  <div className="space-y-3">
+                    {(claimResponse.retrieved_policy_evidence?.length ?? 0) > 0 ? (
+                      claimResponse.retrieved_policy_evidence?.map((evidence) => (
+                        <div key={evidence.evidence_id} className="rounded-[18px] border border-[color:var(--line)] bg-[#fffaf2] p-4">
+                          <div className="flex items-center justify-between gap-3">
+                            <p className="font-semibold text-[var(--ink)]">{evidence.rule_category}</p>
+                            <span className="rounded-full bg-white px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.15em] text-[var(--muted)]">
+                              {evidence.source}
+                            </span>
+                          </div>
+                          <p className="mt-3 text-sm leading-6 text-[var(--muted)]">{evidence.text}</p>
+                        </div>
+                      ))
+                    ) : (
+                      <EmptyState title="No policy evidence" body="The response did not include retrieved evidence." />
+                    )}
                   </div>
-                ) : null}
-              </div>
+                  <div className="space-y-3">
+                    {(claimResponse.component_failures?.length ?? 0) > 0 ? (
+                      claimResponse.component_failures?.map((failure) => (
+                        <div key={`${failure.component}-${failure.message}`} className="rounded-[18px] border border-[#f1c4c0] bg-[#fff1f1] p-4">
+                          <div className="flex items-center gap-2">
+                            <AlertCircle className="h-4 w-4 text-[#a83d35]" />
+                            <p className="font-semibold text-[#7f241d]">{failure.component}</p>
+                          </div>
+                          <p className="mt-2 text-sm leading-6 text-[#9c3b34]">{failure.message}</p>
+                        </div>
+                      ))
+                    ) : (
+                      <EmptyState title="No component failures" body="Warnings and recoverable failures appear here when present." />
+                    )}
+                    {claimResponse.member_action_required ? (
+                      <div className="rounded-[18px] border border-[#f5cfb8] bg-[#fff4eb] p-4">
+                        <p className="text-sm font-semibold text-[#9f5f17]">Member action required</p>
+                        <p className="mt-2 text-sm leading-6 text-[#a06a2a]">{claimResponse.member_action_required.message}</p>
+                      </div>
+                    ) : null}
+                  </div>
+                </div>
+              </Panel>
+            </>
+          ) : (
+            <div className="xl:col-span-2">
+              <EmptyState title="No claim submitted yet" body="Upload a document and submit a claim to populate the trace timeline." />
             </div>
-          </Panel>
+          )}
         </section>
         ) : null}
 
@@ -1226,10 +1356,10 @@ export default function Home() {
             <div className="space-y-4">
               <div className="grid gap-3 sm:grid-cols-2">
                 {[
-                  ["Accuracy", evalRun?.metrics.decision_accuracy, "decision"],
-                  ["Early stop", evalRun?.metrics.early_stop_accuracy, "early"],
-                  ["Amount match", evalRun?.metrics.approved_amount_exact_match_rate, "amount"],
-                  ["RRF recall", evalRun?.metrics.retrieval_recall_at_k, "retrieval"]
+                  ["Accuracy", evalRun?.metrics.decision_accuracy],
+                  ["Early stop", evalRun?.metrics.early_stop_accuracy],
+                  ["Amount match", evalRun?.metrics.approved_amount_exact_match_rate],
+                  ["RRF recall", evalRun?.metrics.retrieval_recall_at_k]
                 ].map(([label, value]) => (
                   <div key={String(label)} className="rounded-[18px] border border-[color:var(--line)] bg-[#fffaf2] p-4">
                     <p className="text-xs font-semibold uppercase tracking-[0.18em] text-[var(--muted)]">{label as string}</p>
@@ -1266,53 +1396,46 @@ export default function Home() {
           </Panel>
 
           <Panel title="Case results" icon={<Menu className="h-4 w-4" />}>
-            <div className="overflow-hidden rounded-[18px] border border-[color:var(--line)] bg-white">
-              <div className="grid grid-cols-12 border-b border-[color:var(--line)] bg-[#fffaf2] px-4 py-3 text-xs font-semibold uppercase tracking-[0.18em] text-[var(--muted)]">
-                <div className="col-span-2">Case</div>
-                <div className="col-span-3">Expected</div>
-                <div className="col-span-3">Actual</div>
-                <div className="col-span-2">Result</div>
-                <div className="col-span-2 text-right">Trace</div>
+              <div className="overflow-hidden rounded-[18px] border border-[color:var(--line)] bg-white">
+                <div className="grid grid-cols-12 border-b border-[color:var(--line)] bg-[#fffaf2] px-4 py-3 text-xs font-semibold uppercase tracking-[0.18em] text-[var(--muted)]">
+                  <div className="col-span-2">Case</div>
+                  <div className="col-span-3">Expected</div>
+                  <div className="col-span-3">Actual</div>
+                  <div className="col-span-2">Result</div>
+                  <div className="col-span-2 text-right">Trace</div>
+                </div>
+                <div className="divide-y divide-[color:var(--line)]">
+                  {evalRun?.cases.length ? (
+                    evalRun.cases.map((item) => (
+                      <div key={item.case_id} className="grid w-full grid-cols-12 gap-3 px-4 py-4 text-left">
+                        <div className="col-span-2">
+                          <div className="text-sm font-semibold text-[var(--ink)]">{item.case_id}</div>
+                          <div className="text-xs text-[var(--muted)]">{item.case_name}</div>
+                        </div>
+                        <div className="col-span-3 text-sm text-[var(--muted)]">
+                          {stringifyExpectation(item.expected)}
+                        </div>
+                        <div className="col-span-3 text-sm text-[var(--muted)]">
+                          {item.actual?.decision?.decision ?? item.actual?.status ?? "N/A"}
+                        </div>
+                        <div className="col-span-2">
+                          <ResultBadge passed={item.passed ?? true} />
+                        </div>
+                        <div className="col-span-2 flex justify-end">
+                          <span className="inline-flex items-center gap-1 text-sm font-medium text-[var(--plum)]">
+                            Trace
+                          </span>
+                        </div>
+                      </div>
+                    ))
+                  ) : (
+                    <div className="p-4">
+                      <EmptyState title="No eval results yet" body="Run the backend eval suite to populate test case results." />
+                    </div>
+                  )}
+                </div>
               </div>
-              <div className="divide-y divide-[color:var(--line)]">
-                {(evalRun?.cases.length ? evalRun.cases : demoCases.map((item) => ({
-                  case_id: item.id,
-                  case_name: item.name,
-                  passed: true,
-                  expected: { decision: item.response.decision?.decision },
-                  actual: item.response,
-                  notes: [item.note]
-                }))).map((item) => (
-                  <button
-                    key={item.case_id}
-                    type="button"
-                    onClick={() => setSelectedCaseId(item.case_id)}
-                    className="grid w-full grid-cols-12 gap-3 px-4 py-4 text-left transition hover:bg-[#fffaf2]"
-                  >
-                    <div className="col-span-2">
-                      <div className="text-sm font-semibold text-[var(--ink)]">{item.case_id}</div>
-                      <div className="text-xs text-[var(--muted)]">{item.case_name}</div>
-                    </div>
-                    <div className="col-span-3 text-sm text-[var(--muted)]">
-                      {stringifyExpectation(item.expected)}
-                    </div>
-                    <div className="col-span-3 text-sm text-[var(--muted)]">
-                      {item.actual?.decision?.decision ?? item.actual?.status ?? "N/A"}
-                    </div>
-                    <div className="col-span-2">
-                      <ResultBadge passed={item.passed ?? true} />
-                    </div>
-                    <div className="col-span-2 flex justify-end">
-                      <span className="inline-flex items-center gap-1 text-sm font-medium text-[var(--plum)]">
-                        Open
-                        <ArrowRight className="h-4 w-4" />
-                      </span>
-                    </div>
-                  </button>
-                ))}
-              </div>
-            </div>
-          </Panel>
+            </Panel>
         </section>
         ) : null}
         </div>
