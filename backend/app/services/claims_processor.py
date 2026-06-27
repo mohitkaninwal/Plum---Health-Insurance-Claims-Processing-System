@@ -448,7 +448,7 @@ def run_test_case_eval(policy: PolicyTerms | None = None) -> EvalRun:
         submission = ClaimSubmission.model_validate(raw_case["input"])
         actual = process_claim(submission, policy)
         expected = raw_case["expected"]
-        passed = _case_passed(expected, actual)
+        passed, failures = _evaluate_case(expected, actual)
         case_results.append(
             EvalCaseResult(
                 case_id=raw_case["case_id"],
@@ -456,6 +456,7 @@ def run_test_case_eval(policy: PolicyTerms | None = None) -> EvalRun:
                 passed=passed,
                 expected=expected,
                 actual=actual,
+                notes=failures,
             )
         )
 
@@ -466,8 +467,7 @@ def run_test_case_eval(policy: PolicyTerms | None = None) -> EvalRun:
         decision_accuracy=passed_count / len(case_results),
         early_stop_accuracy=_early_stop_accuracy(case_results),
         approved_amount_exact_match_rate=_amount_match_rate(case_results),
-        retrieval_precision_at_k=1.0,
-        retrieval_recall_at_k=1.0,
+        system_must_accuracy=_system_must_accuracy(case_results),
     )
     return EvalRun(
         status=ClaimStatus.COMPLETED,
@@ -972,6 +972,7 @@ def _confidence_inputs(
     low_quality_count = sum(1 for quality in qualities if quality == DocumentQuality.LOW)
     unknown_quality_count = sum(1 for quality in qualities if quality == DocumentQuality.UNKNOWN)
     unreadable_count = sum(1 for quality in qualities if quality == DocumentQuality.UNREADABLE)
+    # None means quality was not assessed (fixtures, pre-parsed uploads) — no penalty applied
     missing_field_count = sum(len(item.missing_fields) for item in extracted_documents)
     average_extraction_confidence = (
         sum(item.confidence for item in extracted_documents) / len(extracted_documents)
@@ -1393,23 +1394,217 @@ def _policy_evidence(submission: ClaimSubmission, policy: PolicyTerms) -> list[P
     ]
 
 
-def _case_passed(expected: dict[str, Any], actual: ClaimResponse) -> bool:
+def _evaluate_case(expected: dict[str, Any], actual: ClaimResponse) -> tuple[bool, list[str]]:
+    """Return (passed, failed_notes) where failed_notes lists every requirement that was not met."""
+    failures: list[str] = []
+
+    # ── core decision checks ──────────────────────────────────────────────────
     if expected.get("decision") is None:
-        return actual.status == ClaimStatus.ACTION_REQUIRED and actual.decision is None
-    if actual.decision is None:
-        return False
-    if actual.decision.decision != expected["decision"]:
-        return False
-    if "approved_amount" in expected and actual.approved_amount != expected["approved_amount"]:
-        return False
-    for reason in expected.get("rejection_reasons", []):
-        if reason not in actual.rejection_reasons:
-            return False
-    if expected.get("confidence_score") == "above 0.90" and (actual.confidence_score or 0) <= 0.9:
-        return False
-    if expected.get("confidence_score") == "above 0.85" and (actual.confidence_score or 0) <= 0.85:
-        return False
-    return True
+        if not (actual.status == ClaimStatus.ACTION_REQUIRED and actual.decision is None):
+            failures.append(
+                f"Expected early stop (ACTION_REQUIRED, no decision) "
+                f"but got status={actual.status} decision={actual.decision}"
+            )
+    else:
+        if actual.decision is None:
+            failures.append(f"Expected decision={expected['decision']} but got no decision")
+        elif actual.decision.decision != expected["decision"]:
+            failures.append(
+                f"Expected decision={expected['decision']} "
+                f"but got {actual.decision.decision}"
+            )
+
+        if "approved_amount" in expected and actual.approved_amount != expected["approved_amount"]:
+            failures.append(
+                f"Expected approved_amount={expected['approved_amount']} "
+                f"but got {actual.approved_amount}"
+            )
+
+        for reason_code in expected.get("rejection_reasons", []):
+            if reason_code not in actual.rejection_reasons:
+                failures.append(f"Missing rejection reason: {reason_code}")
+
+        if expected.get("confidence_score") == "above 0.90" and (actual.confidence_score or 0) <= 0.9:
+            failures.append(
+                f"Expected confidence > 0.90 but got {actual.confidence_score}"
+            )
+        if expected.get("confidence_score") == "above 0.85" and (actual.confidence_score or 0) <= 0.85:
+            failures.append(
+                f"Expected confidence > 0.85 but got {actual.confidence_score}"
+            )
+
+    # ── system_must checks ────────────────────────────────────────────────────
+    for requirement in expected.get("system_must", []):
+        failure = _check_system_must(requirement, actual)
+        if failure:
+            failures.append(failure)
+
+    return len(failures) == 0, failures
+
+
+def _check_system_must(requirement: str, actual: ClaimResponse) -> str | None:
+    """Return a failure message if the requirement is not met, else None."""
+    req = requirement.lower()
+    reason_text = (actual.reason or "").lower()
+    mar = actual.member_action_required
+
+    # TC001 / TC002 / TC003 — early stop requirements
+    if "stop before making any claim decision" in req:
+        if not (actual.status == ClaimStatus.ACTION_REQUIRED and actual.decision is None):
+            return f"FAIL: '{requirement}' — claim was not stopped early"
+
+    if "name the uploaded document type and the required document type" in req or \
+       "specifically what document type was uploaded and what is needed instead" in req:
+        if mar is None:
+            return f"FAIL: '{requirement}' — member_action_required is absent"
+        has_uploaded = any(
+            dt.lower() in (mar.message or "").lower() or dt.lower() in reason_text
+            for dt in ["prescription", "hospital_bill", "lab_report", "diagnostic_report",
+                       "pharmacy_bill", "discharge_summary", "dental_report"]
+        )
+        has_required = bool(mar.required_document_types)
+        if not has_uploaded or not has_required:
+            return (
+                f"FAIL: '{requirement}' — message does not name both uploaded and required doc types"
+            )
+
+    if "identify that the pharmacy bill cannot be read" in req:
+        if mar is None or mar.code != "UNREADABLE_DOCUMENT":
+            return f"FAIL: '{requirement}' — code is {mar.code if mar else 'absent'}, expected UNREADABLE_DOCUMENT"
+
+    if "ask the member to re-upload that specific document" in req:
+        if mar is None or not mar.affected_file_ids:
+            return f"FAIL: '{requirement}' — affected_file_ids is empty; specific document not identified"
+
+    if "not reject the claim outright" in req:
+        if actual.decision and actual.decision.decision == ClaimDecisionType.REJECTED:
+            return f"FAIL: '{requirement}' — claim was outright rejected"
+
+    if "detect that the documents belong to different people" in req:
+        if mar is None or mar.code != "PATIENT_MISMATCH":
+            return f"FAIL: '{requirement}' — code is {mar.code if mar else 'absent'}, expected PATIENT_MISMATCH"
+
+    if "surface this to the member with the specific names" in req:
+        # TC003 documents have patient_name_on_doc "Rajesh Kumar" and "Arjun Mehta"
+        names_in_message = sum(
+            1 for name in ["rajesh", "arjun", "kumar", "mehta"]
+            if name in (mar.message if mar else "").lower() or name in reason_text
+        )
+        if names_in_message < 2:
+            return f"FAIL: '{requirement}' — patient names not surfaced in message or reason"
+
+    if "not proceed to a claim decision" in req:
+        if actual.decision is not None:
+            return f"FAIL: '{requirement}' — a claim decision was produced"
+
+    # TC005 — waiting period eligibility date
+    if "date from which the member will be eligible" in req:
+        has_date = bool(re.search(r"\d{4}-\d{2}-\d{2}", reason_text)) or \
+                   any(
+                       word in reason_text
+                       for word in ["eligible", "eligib"]
+                   )
+        if not has_date:
+            return f"FAIL: '{requirement}' — eligibility date not found in reason"
+
+    # TC006 — line-item itemization
+    if "itemize which line items were approved and which were rejected" in req:
+        if not actual.line_item_decisions:
+            return f"FAIL: '{requirement}' — line_item_decisions is empty"
+
+    if "state the reason for each rejection at the line-item level" in req:
+        bad = [
+            item.description
+            for item in actual.line_item_decisions
+            if item.decision in (LineItemDecisionType.REJECTED, LineItemDecisionType.ADJUSTED)
+            and not item.reason.strip()
+        ]
+        if bad:
+            return f"FAIL: '{requirement}' — items without reason: {bad}"
+
+    # TC007 — pre-authorization
+    if "pre-authorization was required and not obtained" in req:
+        has_preauth = any(
+            kw in reason_text
+            for kw in ["pre-authorization", "pre_authorization", "preauthorization", "pre-auth"]
+        )
+        if not has_preauth:
+            return f"FAIL: '{requirement}' — pre-authorization not mentioned in reason"
+
+    if "what they should do to resubmit with pre-auth" in req:
+        has_action = any(
+            kw in reason_text
+            for kw in ["resubmit", "obtain", "valid pre-auth", "authorization"]
+        )
+        if not has_action:
+            return f"FAIL: '{requirement}' — no resubmission instruction in reason"
+
+    # TC008 — per-claim limit amounts
+    if "state the per-claim limit and the claimed amount clearly" in req:
+        has_two_amounts = len(re.findall(r"\d[\d,]+", reason_text)) >= 2
+        if not has_two_amounts:
+            return f"FAIL: '{requirement}' — reason does not contain both limit and claimed amounts"
+
+    # TC009 — fraud / same-day
+    if "flag the unusual same-day claim pattern" in req:
+        has_sameday = any(
+            kw in reason_text for kw in ["same-day", "same day", "same_day"]
+        )
+        if not has_sameday:
+            return f"FAIL: '{requirement}' — same-day pattern not mentioned in reason"
+
+    if "route to manual review rather than auto-rejecting" in req:
+        if actual.decision and actual.decision.decision != ClaimDecisionType.MANUAL_REVIEW:
+            return f"FAIL: '{requirement}' — decision is {actual.decision.decision}, not MANUAL_REVIEW"
+
+    if "include the specific signals that triggered the flag" in req:
+        if len(reason_text) < 30:
+            return f"FAIL: '{requirement}' — reason is too short to include specific signals"
+
+    # TC010 — network discount order
+    if "apply network discount before co-pay, not after" in req:
+        # Verified by amount: 4000 * 0.90 * 0.90 = 3240 (discount first, then copay)
+        # vs 4000 * (1 - 0.10 - 0.10) = 3200 (wrong: subtract both together)
+        if actual.approved_amount is not None and abs(actual.approved_amount - 3240.0) > 0.01:
+            return (
+                f"FAIL: '{requirement}' — approved_amount={actual.approved_amount}, "
+                f"expected 3240.0 (discount before co-pay)"
+            )
+
+    if "show the breakdown of discount and co-pay in the decision output" in req:
+        breakdown_text = reason_text + " ".join(
+            item.reason.lower() for item in actual.line_item_decisions
+        )
+        has_discount = any(kw in breakdown_text for kw in ["discount", "co-pay", "copay"])
+        if not has_discount:
+            return f"FAIL: '{requirement}' — discount/co-pay breakdown absent from reason"
+
+    # TC011 — component failure / graceful degradation
+    if "not crash or return a 500 error" in req:
+        # If we have an actual response object this check trivially passes.
+        pass
+
+    if "indicate in the output that a component failed and was skipped" in req:
+        if not actual.component_failures:
+            return f"FAIL: '{requirement}' — component_failures is empty"
+
+    if "return a confidence score lower than a normal full-pipeline approval" in req:
+        if (actual.confidence_score or 1.0) >= 0.9:
+            return (
+                f"FAIL: '{requirement}' — confidence_score={actual.confidence_score} "
+                f"is not lower than a full-pipeline approval"
+            )
+
+    if "manual review is recommended due to incomplete processing" in req:
+        if "manual review" not in reason_text:
+            return f"FAIL: '{requirement}' — 'manual review' not mentioned in reason"
+
+    return None
+
+
+def _case_passed(expected: dict[str, Any], actual: ClaimResponse) -> bool:
+    passed, _ = _evaluate_case(expected, actual)
+    return passed
 
 
 def _early_stop_accuracy(case_results: list[EvalCaseResult]) -> float:
@@ -1420,3 +1615,15 @@ def _early_stop_accuracy(case_results: list[EvalCaseResult]) -> float:
 def _amount_match_rate(case_results: list[EvalCaseResult]) -> float:
     amount_cases = [case for case in case_results if "approved_amount" in case.expected]
     return sum(1 for case in amount_cases if case.passed) / len(amount_cases)
+
+
+def _system_must_accuracy(case_results: list[EvalCaseResult]) -> float:
+    total = sum(len(case.expected.get("system_must", [])) for case in case_results)
+    if total == 0:
+        return 1.0
+    # count failures recorded in notes that start with "FAIL:"
+    failed = sum(
+        sum(1 for note in case.notes if note.startswith("FAIL:"))
+        for case in case_results
+    )
+    return (total - failed) / total

@@ -57,6 +57,10 @@ class _LLMExtractionPayload(BaseModel):
 
 
 def run_extraction_pipeline(submission: ClaimSubmission) -> ExtractionPipelineResult:
+    preparsed = _extraction_from_preparsed_content(submission)
+    if preparsed is not None:
+        return preparsed
+
     graph = _build_graph()
     state = graph.invoke(
         {
@@ -69,6 +73,100 @@ def run_extraction_pipeline(submission: ClaimSubmission) -> ExtractionPipelineRe
         }
     )
     return ExtractionPipelineResult.model_validate(state)
+
+
+def _extraction_from_preparsed_content(submission: ClaimSubmission) -> ExtractionPipelineResult | None:
+    """
+    Fast path for claims submitted via the frontend upload flow.
+    If every document already has content.parsed_fields from /claims/parse/upload,
+    build the ExtractionPipelineResult directly without re-running LangGraph.
+    """
+    if not submission.documents:
+        return None
+    if not all(
+        isinstance((doc.content or {}).get("parsed_fields"), dict)
+        for doc in submission.documents
+    ):
+        return None
+
+    extracted: list[ExtractedDocumentData] = []
+    low_quality: list[str] = []
+    confidence_impact = 0.0
+
+    for doc in submission.documents:
+        content = doc.content or {}
+        parsed_fields = dict(content.get("parsed_fields") or {})
+        classification = classify_document(doc).classification
+        doc_type = classification.document_type
+
+        if doc.quality in {DocumentQuality.LOW, DocumentQuality.UNKNOWN} and doc.quality is not None:
+            low_quality.append(doc.file_id)
+
+        parsed_confidence = content.get("parsed_confidence")
+        parsed_missing = list(content.get("parsed_missing_fields") or [])
+        parsed_warnings = list(content.get("parsed_warnings") or [])
+
+        confidence = (
+            float(parsed_confidence)
+            if isinstance(parsed_confidence, (int, float))
+            else (0.92 if not parsed_missing else max(0.65, 0.9 - 0.08 * len(parsed_missing)))
+        )
+
+        if parsed_missing:
+            confidence_impact -= min(0.08, 0.02 * len(parsed_missing))
+
+        extracted.append(
+            ExtractedDocumentData(
+                file_id=doc.file_id,
+                document_type=doc_type,
+                fields=parsed_fields,
+                missing_fields=parsed_missing,
+                confidence=confidence,
+                warnings=parsed_warnings,
+            )
+        )
+
+    if low_quality:
+        confidence_impact -= 0.03
+
+    trace = [
+        TraceEvent(
+            component="DocumentVerifierAgent",
+            message="Documents verified; using pre-parsed content from upload step.",
+            input_summary={"document_count": len(submission.documents)},
+            output_summary={
+                "file_ids": [d.file_id for d in submission.documents],
+                "low_or_unknown_quality_file_ids": low_quality,
+            },
+            confidence_impact=-0.03 if low_quality else 0,
+        ),
+        TraceEvent(
+            component="VisionExtractionAgent",
+            message="Re-extraction skipped — fields already parsed during document upload.",
+            output_summary={
+                "documents": [
+                    {
+                        "file_id": item.file_id,
+                        "document_type": item.document_type,
+                        "field_names": sorted(item.fields),
+                        "missing_fields": item.missing_fields,
+                        "confidence": item.confidence,
+                    }
+                    for item in extracted
+                ]
+            },
+            confidence_impact=confidence_impact,
+        ),
+    ]
+
+    return ExtractionPipelineResult(
+        submission=submission,
+        extracted_documents=extracted,
+        trace=trace,
+        component_failures=[],
+        member_action_required=None,
+        confidence_impact=confidence_impact,
+    )
 
 
 def _build_graph() -> Any:
@@ -93,7 +191,7 @@ def _document_verifier_agent(state: _ExtractionState) -> _ExtractionState:
     low_quality = [
         document.file_id
         for document in submission.documents
-        if document.quality in {DocumentQuality.LOW, DocumentQuality.UNKNOWN}
+        if document.quality in {DocumentQuality.LOW, DocumentQuality.UNKNOWN} and document.quality is not None
     ]
     state["classifications"] = classifications
     state["trace"] = [

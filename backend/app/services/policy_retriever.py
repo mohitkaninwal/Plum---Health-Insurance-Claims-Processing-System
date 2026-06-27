@@ -41,7 +41,8 @@ def build_policy_knowledge_base(
     guide_path: Path = SAMPLE_DOCUMENTS_GUIDE_PATH,
 ) -> list[KnowledgeChunk]:
     chunks = _policy_json_chunks(policy)
-    chunks.extend(_sample_document_chunks(guide_path))
+    # sample_documents_guide.md is a development reference for extraction formats,
+    # not policy rules — excluded from the knowledge base to keep evidence relevant.
     return [
         KnowledgeChunk(
             evidence_id=chunk.evidence_id,

@@ -164,10 +164,11 @@ def _member_ytd_summary(
             .where(ClaimIntakeRecord.member_id == member_id)
             .where(ClaimIntakeRecord.treatment_date >= start_of_period)
             .where(ClaimIntakeRecord.treatment_date <= cutoff)
+            .where(ClaimIntakeRecord.status == "COMPLETED")
         )
         rows = list(db.execute(stmt).scalars().all())
         claim_ids = [row.claim_id for row in rows]
-        total = float(sum(float(row.claimed_amount or 0) for row in rows))
+        total = float(sum(float(row.approved_amount or 0) for row in rows))
         return MemberYtdSummary(
             policy_id=policy_id,
             member_id=member_id,

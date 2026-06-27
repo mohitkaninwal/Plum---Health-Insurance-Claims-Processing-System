@@ -78,7 +78,7 @@ class UploadedDocument(BaseModel):
         default=None,
         description="Fixture-only field used by the deterministic test-case adapter.",
     )
-    quality: DocumentQuality = DocumentQuality.UNKNOWN
+    quality: DocumentQuality | None = None
     patient_name_on_doc: str | None = None
     content: dict[str, Any] | None = None
 
@@ -253,11 +253,7 @@ class EvalMetrics(BaseModel):
     decision_accuracy: float | None = None
     early_stop_accuracy: float | None = None
     approved_amount_exact_match_rate: float | None = None
-    reason_precision: float | None = None
-    reason_recall: float | None = None
-    reason_f1: float | None = None
-    retrieval_precision_at_k: float | None = None
-    retrieval_recall_at_k: float | None = None
+    system_must_accuracy: float | None = None
 
 
 class EvalRun(BaseModel):
