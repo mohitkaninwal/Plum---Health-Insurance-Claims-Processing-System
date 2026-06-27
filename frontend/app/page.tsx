@@ -3,13 +3,10 @@
 import Image from "next/image";
 import { startTransition, useEffect, useMemo, useState, type ReactNode } from "react";
 import {
-  Activity,
   AlertCircle,
   ArrowRight,
   BadgeCheck,
   BarChart3,
-  Bot,
-  CalendarDays,
   CheckCircle2,
   Clock3,
   FileText,
@@ -19,10 +16,7 @@ import {
   Menu,
   Paperclip,
   RefreshCw,
-  ShieldCheck,
-  Sparkles,
   UploadCloud,
-  User,
   XCircle
 } from "lucide-react";
 
@@ -436,6 +430,7 @@ const defaultDraft: ClaimDraft = {
 
 export default function Home() {
   const [view, setView] = useState<ViewKey>("submit");
+  const [navOverHero, setNavOverHero] = useState(true);
   const [draft, setDraft] = useState<ClaimDraft>(defaultDraft);
   const [claimResponse, setClaimResponse] = useState<ClaimResponse>(demoCases[0].response);
   const [evalRun, setEvalRun] = useState<EvalRun | null>(null);
@@ -452,14 +447,19 @@ export default function Home() {
     setClaimResponse(selectedDemo.response);
   }, [selectedDemo]);
 
-  const metrics = useMemo(
-    () => [
-      { label: "Policy engine", value: "Deterministic", detail: "Hybrid retrieval + rule checks" },
-      { label: "Eval cases", value: "12", detail: "Expected vs actual traceable" },
-      { label: "Confidence", value: claimResponse.confidence_score ? `${Math.round(claimResponse.confidence_score * 100)}%` : "N/A", detail: "Updated with each submission" }
-    ],
-    [claimResponse.confidence_score]
-  );
+  useEffect(() => {
+    function syncNavbarTheme() {
+      setNavOverHero(window.scrollY < window.innerHeight - 140);
+    }
+
+    syncNavbarTheme();
+    window.addEventListener("scroll", syncNavbarTheme, { passive: true });
+    window.addEventListener("resize", syncNavbarTheme);
+    return () => {
+      window.removeEventListener("scroll", syncNavbarTheme);
+      window.removeEventListener("resize", syncNavbarTheme);
+    };
+  }, []);
 
   async function handleSubmitClaim() {
     setLoading("submit");
@@ -614,211 +614,133 @@ export default function Home() {
     line_item_decisions: claimResponse.line_item_decisions ?? []
   };
 
+  function scrollToSection(targetView: ViewKey) {
+    window.setTimeout(() => {
+      document.getElementById(`${targetView}-section`)?.scrollIntoView({
+        behavior: "smooth",
+        block: "start"
+      });
+    }, 0);
+  }
+
+  function navigateToView(targetView: ViewKey) {
+    setView(targetView);
+    scrollToSection(targetView);
+  }
+
+  async function handleHeroSubmitClaim() {
+    await handleSubmitClaim();
+    scrollToSection("decision");
+  }
+
+  async function handleHeroRunEval() {
+    await handleRunEval();
+    scrollToSection("eval");
+  }
+
   return (
     <main className="min-h-screen bg-[var(--bg)] text-[var(--ink)]">
-      <div className="mx-auto flex min-h-screen w-full max-w-[1440px] flex-col gap-6 px-4 py-4 sm:px-6 lg:px-8">
-        <header className="overflow-hidden rounded-[24px] border border-[color:var(--line)] bg-[var(--panel)] shadow-[0_18px_60px_rgba(29,7,22,0.08)]">
-          <div className="relative border-b border-[color:var(--line)] px-5 py-4 sm:px-6">
-            <div className="absolute inset-0 bg-[radial-gradient(circle_at_top_right,rgba(255,188,159,0.18),transparent_32%),linear-gradient(135deg,rgba(255,241,229,0.9),rgba(255,250,242,0.8))]" />
-            <div className="relative flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
-              <div className="flex items-center gap-4">
-                <div className="flex h-14 w-14 items-center justify-center rounded-2xl bg-[var(--plum)]">
-                  <Image src="/plum-assets/plum-logo.svg" alt="Plum" width={42} height={42} priority />
-                </div>
-                <div>
-                  <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-[var(--plum)]">
-                    Plum Claims Ops
-                  </p>
-                  <h1 className="mt-1 text-2xl font-semibold tracking-[-0.02em] text-[var(--ink)] sm:text-[2.1rem]">
-                    Explainable claims review workspace
-                  </h1>
-                </div>
-              </div>
-              <div className="flex flex-wrap items-center gap-3">
-                <Pill icon={<ShieldCheck className="h-3.5 w-3.5" />} label="Policy-backed" />
-                <Pill icon={<Activity className="h-3.5 w-3.5" />} label="Trace-first" />
-                <Pill icon={<Sparkles className="h-3.5 w-3.5" />} label="Eval ready" />
-              </div>
+      <div className="flex min-h-screen w-full flex-col pb-12">
+        <nav className={`fixed inset-x-0 top-0 z-50 px-4 sm:px-6 lg:px-8 ${navOverHero ? "pt-4" : "pt-2"}`}>
+          <div className={`plum-nav ${navOverHero ? "plum-nav--hero" : "plum-nav--solid"}`}>
+            <button
+              type="button"
+              onClick={() => window.scrollTo({ top: 0, behavior: "smooth" })}
+              className="flex min-w-0 items-center gap-4 text-left"
+            >
+              <Image
+                src="/plum-assets/plum-logo.svg"
+                alt="Plum"
+                width={126}
+                height={39}
+                priority
+                className="plum-nav__logo h-auto w-[112px] shrink-0 drop-shadow-[0_8px_20px_rgba(0,0,0,0.35)] sm:w-[126px]"
+              />
+              <span className="plum-nav__meta hidden min-w-0 sm:block">
+                <span className="block text-[11px] font-semibold uppercase tracking-[0.22em] text-[#fff1e5]/75">
+                  Plum Claims Ops
+                </span>
+                <span className="mt-1 block text-sm text-[#fff1e5]/80">Explainable health claims workspace</span>
+              </span>
+            </button>
+
+            <div className="plum-nav__tabs">
+              {([
+                ["submit", "Submit", UploadCloud],
+                ["decision", "Review", Layers3],
+                ["eval", "Evaluate", BarChart3]
+              ] as const).map(([key, label, Icon]) => (
+                <button
+                  key={key}
+                  type="button"
+                  onClick={() => navigateToView(key)}
+                  className={`plum-nav__tab ${view === key ? "plum-nav__tab--active" : ""}`}
+                >
+                  <Icon className="h-4 w-4" />
+                  {label}
+                </button>
+              ))}
             </div>
           </div>
+        </nav>
 
-          <div className="grid gap-4 p-5 sm:p-6 xl:grid-cols-[1.2fr_0.8fr]">
-            <section className="space-y-5">
-              <div className="grid gap-4 md:grid-cols-3">
-                {metrics.map((metric) => (
-                  <MetricCard key={metric.label} {...metric} />
-                ))}
+        <header className="relative min-h-screen w-full overflow-hidden bg-[#1d0716] text-white shadow-[0_28px_90px_rgba(29,7,22,0.18)]">
+          <Image
+            src="/plum-assets/homepage.webp"
+            alt="Plum wallpaper background"
+            fill
+            priority
+            className="object-cover"
+            sizes="100vw"
+          />
+          <div className="absolute inset-0 bg-[linear-gradient(180deg,rgba(29,7,22,0.58)_0%,rgba(29,7,22,0.24)_46%,rgba(29,7,22,0.86)_100%)]" />
+          <div className="absolute inset-0 bg-[radial-gradient(circle_at_50%_42%,rgba(255,177,136,0.18),transparent_30%)]" />
+
+          <div className="relative mx-auto flex min-h-screen w-full max-w-[1480px] flex-col px-5 py-24 sm:px-7 lg:px-10">
+            <div className="mx-auto flex w-full max-w-4xl flex-1 flex-col items-center justify-center text-center">
+              <h1 className="max-w-4xl text-5xl font-semibold leading-[0.98] tracking-normal text-[#fffaf2] sm:text-6xl lg:text-7xl">
+                Claims review with Plum clarity
+              </h1>
+              <p className="mt-6 max-w-2xl text-base leading-7 text-[#fff1e5]/88 sm:text-lg">
+                Submit claims, inspect policy-backed decisions, and run evaluation checks from a calmer operations desk.
+              </p>
+              <div className="mt-8 flex flex-wrap justify-center gap-3">
+                <button
+                  type="button"
+                  onClick={() => startTransition(() => handleHeroSubmitClaim())}
+                  className="inline-flex items-center justify-center gap-2 rounded-full bg-[#ff4658] px-5 py-3 text-sm font-semibold text-white shadow-[0_16px_36px_rgba(255,70,88,0.28)] transition hover:bg-[#ff5b69]"
+                >
+                  {loading === "submit" ? <Loader2 className="h-4 w-4 animate-spin" /> : <ArrowRight className="h-4 w-4" />}
+                  Submit claim
+                </button>
+                <button
+                  type="button"
+                  onClick={() => startTransition(() => handleHeroRunEval())}
+                  className="inline-flex items-center justify-center gap-2 rounded-full border border-white/35 bg-white/10 px-5 py-3 text-sm font-semibold text-white backdrop-blur-md transition hover:bg-white/18"
+                >
+                  {loading === "eval" ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
+                  Run eval
+                </button>
               </div>
+            </div>
 
-              <div className="flex flex-wrap gap-2">
-                {([
-                  ["submit", "Claim submission", UploadCloud],
-                  ["decision", "Decision review", Layers3],
-                  ["eval", "Eval dashboard", BarChart3]
-                ] as const).map(([key, label, Icon]) => (
-                  <button
-                    key={key}
-                    type="button"
-                    onClick={() => setView(key)}
-                    className={`inline-flex items-center gap-2 rounded-full border px-4 py-2 text-sm font-medium transition ${
-                      view === key
-                        ? "border-[var(--plum)] bg-[var(--plum)] text-white"
-                        : "border-[color:var(--line)] bg-white text-[var(--ink)] hover:border-[var(--plum)]/30"
-                    }`}
-                  >
-                    <Icon className="h-4 w-4" />
-                    {label}
-                  </button>
-                ))}
-              </div>
-
-              <div className="grid gap-4 lg:grid-cols-[1.2fr_0.8fr]">
-                <div className="overflow-hidden rounded-[22px] border border-[color:var(--line)] bg-[#fffaf2]">
-                  <div className="flex items-center justify-between border-b border-[color:var(--line)] px-5 py-4">
-                    <div>
-                      <p className="text-xs font-semibold uppercase tracking-[0.2em] text-[var(--muted)]">
-                        Workflow
-                      </p>
-                      <h2 className="mt-1 text-lg font-semibold text-[var(--ink)]">
-                        Submission, adjudication, and eval in one view
-                      </h2>
-                    </div>
-                    <span className="rounded-full bg-[#fde7db] px-3 py-1 text-xs font-semibold text-[#a94d26]">
-                      Live API + demo fallback
-                    </span>
-                  </div>
-                  <div className="grid gap-4 px-5 py-5 sm:grid-cols-2">
-                    <div className="rounded-[18px] border border-[color:var(--line)] bg-white p-4">
-                      <div className="mb-4 flex items-center gap-2 text-sm font-semibold text-[var(--ink)]">
-                        <User className="h-4 w-4 text-[var(--plum)]" />
-                        Member intake
-                      </div>
-                      <p className="text-sm leading-6 text-[var(--muted)]">
-                        Capture the claim context, supporting docs, and line-item evidence with a
-                        Pluм-style, low-noise review flow.
-                      </p>
-                    </div>
-                    <div className="rounded-[18px] border border-[color:var(--line)] bg-white p-4">
-                      <div className="mb-4 flex items-center gap-2 text-sm font-semibold text-[var(--ink)]">
-                        <BadgeCheck className="h-4 w-4 text-[#1f8f5c]" />
-                        Deterministic output
-                      </div>
-                      <p className="text-sm leading-6 text-[var(--muted)]">
-                        The backend returns trace events, policy evidence, confidence, and
-                        component warnings for every adjudication.
-                      </p>
-                    </div>
-                  </div>
-                </div>
-
-                <div className="overflow-hidden rounded-[22px] border border-[color:var(--line)] bg-[linear-gradient(180deg,#1d0716,#2a0d20)] text-white">
-                  <div className="border-b border-white/10 px-5 py-4">
-                    <p className="text-xs font-semibold uppercase tracking-[0.2em] text-[#fff1e5]/70">
-                      Brand reference
-                    </p>
-                    <h2 className="mt-1 text-lg font-semibold">Plum visual language</h2>
-                  </div>
-                  <div className="relative min-h-[320px]">
-                    <Image
-                      src="/plum-assets/homepage.webp"
-                      alt="Plum official website export"
-                      fill
-                      className="object-cover opacity-92"
-                      sizes="(max-width: 1024px) 100vw, 40vw"
-                    />
-                    <div className="absolute inset-0 bg-gradient-to-t from-[#1d0716] via-[#1d0716]/70 to-transparent" />
-                    <div className="absolute inset-x-0 bottom-0 p-5">
-                      <p className="text-sm leading-6 text-[#fff1e5]/90">
-                        Warm cream surfaces, deep plum framing, compact typography, and a quiet
-                        operations feel that still reads premium.
-                      </p>
-                    </div>
-                  </div>
-                </div>
-              </div>
-            </section>
-
-            <aside className="grid gap-4">
-              <div className="overflow-hidden rounded-[22px] border border-[color:var(--line)] bg-white">
-                <div className="border-b border-[color:var(--line)] px-5 py-4">
-                  <p className="text-xs font-semibold uppercase tracking-[0.2em] text-[var(--muted)]">
-                    Backend target
-                  </p>
-                  <div className="mt-2 flex items-center gap-2 text-sm text-[var(--muted)]">
-                    <Bot className="h-4 w-4 text-[var(--plum)]" />
-                    <span className="break-all">{apiBaseUrl}</span>
-                  </div>
-                </div>
-                <div className="space-y-3 p-5">
-                  <div className="flex items-center justify-between text-sm">
-                    <span className="text-[var(--muted)]">Status</span>
-                    <span className="font-medium text-[#1f8f5c]">{statusMessage}</span>
-                  </div>
-                  {error ? (
-                    <div className="flex items-start gap-3 rounded-[16px] border border-[#f1c4c0] bg-[#fff1f1] p-4 text-sm text-[#a83d35]">
-                      <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
-                      <span>{error}</span>
-                    </div>
-                  ) : null}
-                  <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-1">
-                    <button
-                      type="button"
-                      onClick={() => startTransition(() => handleSubmitClaim())}
-                      className="inline-flex items-center justify-center gap-2 rounded-full bg-[var(--plum)] px-4 py-3 text-sm font-semibold text-white transition hover:opacity-95"
-                    >
-                      {loading === "submit" ? <Loader2 className="h-4 w-4 animate-spin" /> : <ArrowRight className="h-4 w-4" />}
-                      Submit claim
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => startTransition(() => handleRunEval())}
-                      className="inline-flex items-center justify-center gap-2 rounded-full border border-[color:var(--line)] bg-[#fffaf2] px-4 py-3 text-sm font-semibold text-[var(--ink)] transition hover:border-[var(--plum)]/30"
-                    >
-                      {loading === "eval" ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
-                      Run eval
-                    </button>
-                  </div>
-                </div>
-              </div>
-
-              <div className="overflow-hidden rounded-[22px] border border-[color:var(--line)] bg-[#fffaf2]">
-                <div className="border-b border-[color:var(--line)] px-5 py-4">
-                  <p className="text-xs font-semibold uppercase tracking-[0.2em] text-[var(--muted)]">
-                    Demo case presets
-                  </p>
-                </div>
-                <div className="grid gap-3 p-5">
-                  {demoCases.map((item) => (
-                    <button
-                      key={item.id}
-                      type="button"
-                      onClick={() => loadDemoCase(item.id)}
-                      className={`flex items-start justify-between rounded-[18px] border p-4 text-left transition ${
-                        selectedCaseId === item.id
-                          ? "border-[var(--plum)] bg-white shadow-[0_10px_30px_rgba(29,7,22,0.07)]"
-                          : "border-[color:var(--line)] bg-white/70 hover:border-[var(--plum)]/30"
-                      }`}
-                    >
-                      <div className="pr-3">
-                        <div className="flex items-center gap-2">
-                          <span className="text-sm font-semibold text-[var(--ink)]">{item.id}</span>
-                          <span className="rounded-full bg-[#fde7db] px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.15em] text-[#a94d26]">
-                            {item.category}
-                          </span>
-                        </div>
-                        <p className="mt-1 text-sm text-[var(--muted)]">{item.note}</p>
-                      </div>
-                      <ArrowRight className="mt-1 h-4 w-4 shrink-0 text-[var(--plum)]" />
-                    </button>
-                  ))}
-                </div>
-              </div>
-            </aside>
           </div>
         </header>
 
-        <section className="grid gap-6 xl:grid-cols-[1.04fr_0.96fr]">
-          <div className="space-y-6">
+        <div className="mx-auto flex w-full max-w-[1480px] flex-col gap-8 px-4 pt-8 sm:px-6 lg:px-8">
+        {error ? (
+          <div className="flex items-start gap-3 rounded-[18px] border border-[#f1c4c0] bg-[#fff1f1] p-4 text-sm text-[#a83d35]">
+            <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
+            <span>{error}</span>
+          </div>
+        ) : null}
+
+        {view !== "eval" ? (
+        <section
+          id={view === "submit" ? "submit-section" : "decision-section"}
+          className={`grid scroll-mt-32 gap-6 ${view === "submit" ? "xl:grid-cols-[1.04fr_0.96fr]" : ""}`}
+        >
+          <div className={view === "decision" ? "hidden" : "space-y-6"}>
             <Panel title="Claim submission" icon={<UploadCloud className="h-4 w-4" />}>
               <div className="grid gap-4 md:grid-cols-2">
                 <Field label="Member ID">
@@ -1027,7 +949,7 @@ export default function Home() {
             </Panel>
           </div>
 
-          <div className="space-y-6">
+          <div className={view === "decision" ? "space-y-6" : "space-y-6"}>
             <Panel title="Decision review" icon={<BadgeCheck className="h-4 w-4" />}>
               <div className="grid gap-4 md:grid-cols-[0.78fr_1.22fr]">
                 <div className="rounded-[22px] border border-[color:var(--line)] bg-[linear-gradient(180deg,#1d0716,#351325)] p-5 text-white">
@@ -1133,8 +1055,10 @@ export default function Home() {
             </Panel>
           </div>
         </section>
+        ) : null}
 
-        <section className="grid gap-6 xl:grid-cols-[0.92fr_1.08fr]">
+        {view === "decision" ? (
+        <section className="grid scroll-mt-32 gap-6 xl:grid-cols-[0.92fr_1.08fr]">
           <Panel title="Trace timeline" icon={<Clock3 className="h-4 w-4" />}>
             <div className="space-y-3">
               {(claimResponse.trace?.length ?? 0) > 0 ? (
@@ -1209,8 +1133,10 @@ export default function Home() {
             </div>
           </Panel>
         </section>
+        ) : null}
 
-        <section className="grid gap-6 xl:grid-cols-[0.82fr_1.18fr]">
+        {view === "eval" ? (
+        <section id="eval-section" className="grid scroll-mt-32 gap-6 xl:grid-cols-[0.82fr_1.18fr]">
           <Panel title="Eval dashboard" icon={<BarChart3 className="h-4 w-4" />}>
             <div className="space-y-4">
               <div className="grid gap-3 sm:grid-cols-2">
@@ -1303,6 +1229,8 @@ export default function Home() {
             </div>
           </Panel>
         </section>
+        ) : null}
+        </div>
       </div>
     </main>
   );
@@ -1342,24 +1270,6 @@ function Field({
       <span className="font-medium text-[var(--ink)]">{label}</span>
       {children}
     </label>
-  );
-}
-
-function MetricCard({
-  label,
-  value,
-  detail
-}: {
-  label: string;
-  value: string;
-  detail: string;
-}) {
-  return (
-    <div className="rounded-[20px] border border-[color:var(--line)] bg-white p-4">
-      <p className="text-xs font-semibold uppercase tracking-[0.18em] text-[var(--muted)]">{label}</p>
-      <p className="mt-2 text-2xl font-semibold tracking-[-0.03em] text-[var(--ink)]">{value}</p>
-      <p className="mt-1 text-sm leading-6 text-[var(--muted)]">{detail}</p>
-    </div>
   );
 }
 
