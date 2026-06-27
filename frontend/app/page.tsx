@@ -4,6 +4,7 @@ import Image from "next/image";
 import { startTransition, useEffect, useMemo, useState, type ReactNode } from "react";
 import {
   AlertCircle,
+  ArrowLeft,
   ArrowRight,
   BadgeCheck,
   BarChart3,
@@ -16,6 +17,7 @@ import {
   Menu,
   Paperclip,
   RefreshCw,
+  Sparkles,
   UploadCloud,
   XCircle
 } from "lucide-react";
@@ -410,22 +412,7 @@ const defaultDraft: ClaimDraft = {
   claimedAmount: "1500",
   ytdClaimsAmount: "5000",
   hospitalName: "City Clinic, Bengaluru",
-  documents: [
-    {
-      id: "doc-1",
-      file: null,
-      declaredType: "PRESCRIPTION",
-      patientName: "Rajesh Kumar",
-      quality: "GOOD"
-    },
-    {
-      id: "doc-2",
-      file: null,
-      declaredType: "HOSPITAL_BILL",
-      patientName: "Rajesh Kumar",
-      quality: "GOOD"
-    }
-  ]
+  documents: []
 };
 
 export default function Home() {
@@ -433,11 +420,14 @@ export default function Home() {
   const [navOverHero, setNavOverHero] = useState(true);
   const [draft, setDraft] = useState<ClaimDraft>(defaultDraft);
   const [claimResponse, setClaimResponse] = useState<ClaimResponse>(demoCases[0].response);
+  const [hasReviewResult, setHasReviewResult] = useState(false);
   const [evalRun, setEvalRun] = useState<EvalRun | null>(null);
-  const [statusMessage, setStatusMessage] = useState<string>("Use a demo case or submit the form to inspect the trace.");
+  const [statusMessage, setStatusMessage] = useState<string>("Upload documents to start — details will be parsed automatically.");
   const [loading, setLoading] = useState<"submit" | "eval" | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [selectedCaseId, setSelectedCaseId] = useState<string>(demoCases[0].id);
+  const [submitStep, setSubmitStep] = useState<"upload" | "details">("upload");
+  const [isDragging, setIsDragging] = useState(false);
 
   const selectedDemo = useMemo(() => {
     return demoCases.find((item) => item.id === selectedCaseId) ?? demoCases[0];
@@ -529,16 +519,61 @@ export default function Home() {
       }
 
       setClaimResponse(response);
+      setHasReviewResult(true);
       setView("decision");
+      setSubmitStep("upload");
       setStatusMessage(`Claim ${response.claim_id} returned ${response.status}.`);
     } catch (submissionError) {
       setError(submissionError instanceof Error ? submissionError.message : "Submission failed");
-      setClaimResponse(selectedDemo.response);
-      setStatusMessage("Falling back to demo trace while the backend is unavailable.");
-      setView("decision");
+      setHasReviewResult(false);
+      setStatusMessage("Submission failed. Fix the issue and submit again.");
+      setView("submit");
     } finally {
       setLoading(null);
     }
+  }
+
+  function addFilesToDraft(files: FileList | File[]) {
+    const incoming = Array.from(files);
+    const newDocs: DocumentDraft[] = incoming.map((file, i) => {
+      const stem = file.name.replace(/\.[^.]+$/, "").toLowerCase().replace(/[-\s]/g, "_");
+      let guessedType: DocumentType = "UNKNOWN";
+      if (stem.includes("prescription") || stem.includes("rx")) guessedType = "PRESCRIPTION";
+      else if (stem.includes("pharmacy") || stem.includes("medicine") || stem.includes("drug")) guessedType = "PHARMACY_BILL";
+      else if (stem.includes("lab") || stem.includes("pathology")) guessedType = "LAB_REPORT";
+      else if (stem.includes("diagnostic") || stem.includes("scan") || stem.includes("mri") || stem.includes("xray")) guessedType = "DIAGNOSTIC_REPORT";
+      else if (stem.includes("discharge")) guessedType = "DISCHARGE_SUMMARY";
+      else if (stem.includes("dental")) guessedType = "DENTAL_REPORT";
+      else if (stem.includes("bill") || stem.includes("invoice") || stem.includes("receipt")) guessedType = "HOSPITAL_BILL";
+      return {
+        id: `doc-${Date.now()}-${i}`,
+        file,
+        declaredType: guessedType,
+        patientName: "",
+        quality: "UNKNOWN"
+      };
+    });
+    setDraft((current) => ({ ...current, documents: [...current.documents, ...newDocs] }));
+  }
+
+  function handleDropZoneFiles(event: React.ChangeEvent<HTMLInputElement>) {
+    if (event.target.files?.length) addFilesToDraft(event.target.files);
+    event.target.value = "";
+  }
+
+  function handleDragOver(event: React.DragEvent) {
+    event.preventDefault();
+    setIsDragging(true);
+  }
+
+  function handleDragLeave() {
+    setIsDragging(false);
+  }
+
+  function handleDrop(event: React.DragEvent) {
+    event.preventDefault();
+    setIsDragging(false);
+    if (event.dataTransfer.files?.length) addFilesToDraft(event.dataTransfer.files);
   }
 
   async function handleRunEval() {
@@ -601,6 +636,7 @@ export default function Home() {
       claimCategory: item.category,
       claimedAmount: String(item.amount)
     }));
+    setHasReviewResult(true);
     setView("decision");
     setStatusMessage(`Loaded ${item.id} into the review panel.`);
   }
@@ -624,13 +660,18 @@ export default function Home() {
   }
 
   function navigateToView(targetView: ViewKey) {
+    if (targetView === "decision" && !hasReviewResult) {
+      setStatusMessage("Submit a claim before opening review.");
+      setView("submit");
+      scrollToSection("submit");
+      return;
+    }
     setView(targetView);
     scrollToSection(targetView);
   }
 
-  async function handleHeroSubmitClaim() {
-    await handleSubmitClaim();
-    scrollToSection("decision");
+  function handleHeroSubmitClaim() {
+    navigateToView("submit");
   }
 
   async function handleHeroRunEval() {
@@ -674,7 +715,10 @@ export default function Home() {
                   key={key}
                   type="button"
                   onClick={() => navigateToView(key)}
-                  className={`plum-nav__tab ${view === key ? "plum-nav__tab--active" : ""}`}
+                  disabled={key === "decision" && !hasReviewResult}
+                  className={`plum-nav__tab ${view === key ? "plum-nav__tab--active" : ""} ${
+                    key === "decision" && !hasReviewResult ? "cursor-not-allowed opacity-45" : ""
+                  }`}
                 >
                   <Icon className="h-4 w-4" />
                   {label}
@@ -707,10 +751,10 @@ export default function Home() {
               <div className="mt-8 flex flex-wrap justify-center gap-3">
                 <button
                   type="button"
-                  onClick={() => startTransition(() => handleHeroSubmitClaim())}
+                  onClick={handleHeroSubmitClaim}
                   className="inline-flex items-center justify-center gap-2 rounded-full bg-[#ff4658] px-5 py-3 text-sm font-semibold text-white shadow-[0_16px_36px_rgba(255,70,88,0.28)] transition hover:bg-[#ff5b69]"
                 >
-                  {loading === "submit" ? <Loader2 className="h-4 w-4 animate-spin" /> : <ArrowRight className="h-4 w-4" />}
+                  <ArrowRight className="h-4 w-4" />
                   Submit claim
                 </button>
                 <button
@@ -738,218 +782,259 @@ export default function Home() {
         {view !== "eval" ? (
         <section
           id={view === "submit" ? "submit-section" : "decision-section"}
-          className={`grid scroll-mt-32 gap-6 ${view === "submit" ? "xl:grid-cols-[1.04fr_0.96fr]" : ""}`}
+          className={`scroll-mt-32 gap-6 ${view === "decision" ? "grid xl:grid-cols-[1.04fr_0.96fr]" : "flex justify-center"}`}
         >
-          <div className={view === "decision" ? "hidden" : "space-y-6"}>
-            <Panel title="Claim submission" icon={<UploadCloud className="h-4 w-4" />}>
-              <div className="grid gap-4 md:grid-cols-2">
-                <Field label="Member ID">
-                  <input
-                    value={draft.memberId}
-                    onChange={(event) => setDraft((current) => ({ ...current, memberId: event.target.value }))}
-                    className="field"
-                    placeholder="EMP001"
-                  />
-                </Field>
-                <Field label="Policy ID">
-                  <input
-                    value={draft.policyId}
-                    onChange={(event) => setDraft((current) => ({ ...current, policyId: event.target.value }))}
-                    className="field"
-                    placeholder="PLUM_GHI_2024"
-                  />
-                </Field>
-                <Field label="Claim category">
-                  <select
-                    value={draft.claimCategory}
-                    onChange={(event) => setDraft((current) => ({ ...current, claimCategory: event.target.value as ClaimCategory }))}
-                    className="field"
-                  >
-                    {["CONSULTATION", "DIAGNOSTIC", "PHARMACY", "DENTAL", "VISION", "ALTERNATIVE_MEDICINE"].map((option) => (
-                      <option key={option} value={option}>
-                        {option}
-                      </option>
-                    ))}
-                  </select>
-                </Field>
-                <Field label="Treatment date">
-                  <input
-                    type="date"
-                    value={draft.treatmentDate}
-                    onChange={(event) => setDraft((current) => ({ ...current, treatmentDate: event.target.value }))}
-                    className="field"
-                  />
-                </Field>
-                <Field label="Claimed amount">
-                  <input
-                    type="number"
-                    min="1"
-                    value={draft.claimedAmount}
-                    onChange={(event) => setDraft((current) => ({ ...current, claimedAmount: event.target.value }))}
-                    className="field"
-                  />
-                </Field>
-                <Field label="Year-to-date amount">
-                  <input
-                    type="number"
-                    min="0"
-                    value={draft.ytdClaimsAmount}
-                    onChange={(event) => setDraft((current) => ({ ...current, ytdClaimsAmount: event.target.value }))}
-                    className="field"
-                    placeholder="Optional"
-                  />
-                </Field>
-                <Field label="Hospital name">
-                  <input
-                    value={draft.hospitalName}
-                    onChange={(event) => setDraft((current) => ({ ...current, hospitalName: event.target.value }))}
-                    className="field"
-                    placeholder="Optional"
-                  />
-                </Field>
-              </div>
-            </Panel>
-
-            <Panel title="Documents" icon={<Paperclip className="h-4 w-4" />}>
-              <div className="space-y-3">
-                {draft.documents.map((document, index) => (
-                  <div key={document.id} className="grid gap-3 rounded-[18px] border border-[color:var(--line)] bg-[#fffaf2] p-4 md:grid-cols-[1.2fr_0.8fr_0.8fr_0.6fr_auto]">
-                    <label className="flex flex-col gap-2 text-sm">
-                      <span className="font-medium text-[var(--ink)]">File {index + 1}</span>
-                      <input
-                        type="file"
-                        onChange={(event) => {
-                          const file = event.target.files?.[0] ?? null;
-                          setDraft((current) => ({
-                            ...current,
-                            documents: current.documents.map((item) =>
-                              item.id === document.id ? { ...item, file } : item
-                            )
-                          }));
-                        }}
-                        className="block w-full text-sm text-[var(--muted)] file:mr-4 file:rounded-full file:border-0 file:bg-[var(--plum)] file:px-4 file:py-2 file:text-sm file:font-semibold file:text-white hover:file:opacity-95"
-                      />
-                      <span className="text-xs text-[var(--muted)]">
-                        {document.file ? document.file.name : "No file chosen, fixture mode is active"}
-                      </span>
-                    </label>
-                    <Field label="Declared type">
-                      <select
-                        value={document.declaredType}
-                        onChange={(event) => {
-                          setDraft((current) => ({
-                            ...current,
-                            documents: current.documents.map((item) =>
-                              item.id === document.id
-                                ? { ...item, declaredType: event.target.value as DocumentType }
-                                : item
-                            )
-                          }));
-                        }}
-                        className="field"
-                      >
-                        {[
-                          "PRESCRIPTION",
-                          "HOSPITAL_BILL",
-                          "LAB_REPORT",
-                          "DIAGNOSTIC_REPORT",
-                          "PHARMACY_BILL",
-                          "DISCHARGE_SUMMARY",
-                          "DENTAL_REPORT",
-                          "UNKNOWN"
-                        ].map((option) => (
-                          <option key={option} value={option}>
-                            {option}
-                          </option>
-                        ))}
-                      </select>
-                    </Field>
-                    <Field label="Patient name">
-                      <input
-                        value={document.patientName}
-                        onChange={(event) => {
-                          setDraft((current) => ({
-                            ...current,
-                            documents: current.documents.map((item) =>
-                              item.id === document.id
-                                ? { ...item, patientName: event.target.value }
-                                : item
-                            )
-                          }));
-                        }}
-                        className="field"
-                        placeholder="Rajesh Kumar"
-                      />
-                    </Field>
-                    <Field label="Quality">
-                      <select
-                        value={document.quality}
-                        onChange={(event) => {
-                          setDraft((current) => ({
-                            ...current,
-                            documents: current.documents.map((item) =>
-                              item.id === document.id
-                                ? { ...item, quality: event.target.value as DocumentDraft["quality"] }
-                                : item
-                            )
-                          }));
-                        }}
-                        className="field"
-                      >
-                        {["GOOD", "LOW", "UNREADABLE", "UNKNOWN"].map((option) => (
-                          <option key={option} value={option}>
-                            {option}
-                          </option>
-                        ))}
-                      </select>
-                    </Field>
-                    <div className="flex items-end">
-                      <button
-                        type="button"
-                        onClick={() =>
-                          setDraft((current) => ({
-                            ...current,
-                            documents:
-                              current.documents.length > 1
-                                ? current.documents.filter((item) => item.id !== document.id)
-                                : current.documents
-                          }))
-                        }
-                        className="inline-flex h-11 items-center justify-center rounded-full border border-[color:var(--line)] px-4 text-sm font-semibold text-[var(--muted)] transition hover:border-[#dfb2a0] hover:text-[var(--ink)]"
-                      >
-                        <XCircle className="mr-2 h-4 w-4" />
-                        Remove
-                      </button>
-                    </div>
+          <div className={view === "decision" ? "hidden" : "w-full max-w-2xl space-y-5"}>
+            <Panel title="New claim" icon={<UploadCloud className="h-4 w-4" />}>
+              {/* Step indicator */}
+              <div className="mb-6 flex items-center gap-0">
+                <div className="flex items-center gap-2.5">
+                  <div className={`flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-xs font-bold ${submitStep === "upload" ? "bg-[var(--plum)] text-white" : "bg-[#e7f4ee] text-[#1f8f5c]"}`}>
+                    {submitStep === "details" ? <CheckCircle2 className="h-4 w-4" /> : "1"}
                   </div>
-                ))}
-                <button
-                  type="button"
-                  onClick={() =>
-                    setDraft((current) => ({
-                      ...current,
-                      documents: [
-                        ...current.documents,
-                        {
-                          id: `doc-${current.documents.length + 1}`,
-                          file: null,
-                          declaredType: "HOSPITAL_BILL",
-                          patientName: "",
-                          quality: "UNKNOWN"
-                        }
-                      ]
-                    }))
-                  }
-                  className="inline-flex items-center gap-2 rounded-full border border-[color:var(--line)] bg-white px-4 py-2.5 text-sm font-semibold text-[var(--ink)] transition hover:border-[var(--plum)]/30"
-                >
-                  <Menu className="h-4 w-4" />
-                  Add another document
-                </button>
+                  <span className={`text-sm font-semibold ${submitStep === "upload" ? "text-[var(--ink)]" : "text-[#1f8f5c]"}`}>
+                    Upload documents
+                  </span>
+                </div>
+                <div className={`mx-3 h-px flex-1 transition-colors duration-300 ${submitStep === "details" ? "bg-[var(--plum)]/40" : "bg-[color:var(--line)]"}`} />
+                <div className="flex items-center gap-2.5">
+                  <div className={`flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-xs font-bold ${submitStep === "details" ? "bg-[var(--plum)] text-white" : "bg-[color:var(--line)] text-[var(--muted)]"}`}>2</div>
+                  <span className={`text-sm font-semibold ${submitStep === "details" ? "text-[var(--ink)]" : "text-[var(--muted)]"}`}>
+                    Claim details
+                  </span>
+                </div>
               </div>
+
+              {/* ── STEP 1: Upload ── */}
+              {submitStep === "upload" && (
+                <div className="space-y-4">
+                  {/* Drop zone */}
+                  <div
+                    onDragOver={handleDragOver}
+                    onDragLeave={handleDragLeave}
+                    onDrop={handleDrop}
+                    className={`relative flex flex-col items-center justify-center rounded-[20px] border-2 border-dashed px-8 py-14 text-center transition-colors duration-150 ${isDragging ? "border-[var(--plum)] bg-[#fdf4f9]" : "border-[color:var(--line)] bg-[#fffaf2] hover:border-[var(--plum)]/50"}`}
+                  >
+                    <input
+                      type="file"
+                      multiple
+                      accept="image/*,.pdf"
+                      className="absolute inset-0 cursor-pointer opacity-0"
+                      onChange={handleDropZoneFiles}
+                    />
+                    <div className={`flex h-14 w-14 items-center justify-center rounded-full transition-colors ${isDragging ? "bg-[var(--plum)] text-white" : "bg-[var(--plum)]/10 text-[var(--plum)]"}`}>
+                      <UploadCloud className="h-6 w-6" />
+                    </div>
+                    <p className="mt-4 text-base font-semibold text-[var(--ink)]">
+                      {isDragging ? "Drop to upload" : "Drop documents here"}
+                    </p>
+                    <p className="mt-1 text-sm text-[var(--muted)]">or click anywhere to browse · bills, prescriptions, lab reports, PDFs</p>
+                    <p className="mt-3 text-xs text-[var(--muted)]">
+                      Document type is detected automatically from the filename
+                    </p>
+                  </div>
+
+                  {/* Uploaded files */}
+                  {draft.documents.length > 0 && (
+                    <div className="space-y-2">
+                      <p className="text-xs font-semibold uppercase tracking-[0.18em] text-[var(--muted)]">
+                        {draft.documents.length} document{draft.documents.length > 1 ? "s" : ""} ready
+                      </p>
+                      {draft.documents.map((document, index) => (
+                        <div key={document.id} className="grid items-start gap-3 rounded-[16px] border border-[color:var(--line)] bg-white p-3.5 sm:grid-cols-[auto_1fr_0.9fr_0.9fr_auto]">
+                          {/* File icon + name */}
+                          <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-[10px] bg-[var(--plum)]/8 text-[var(--plum)]">
+                            <FileText className="h-5 w-5" />
+                          </div>
+                          <div className="min-w-0">
+                            <p className="truncate text-sm font-semibold text-[var(--ink)]">
+                              {document.file ? document.file.name : `Fixture doc ${index + 1}`}
+                            </p>
+                            <p className="text-xs text-[var(--muted)]">
+                              {document.file ? `${(document.file.size / 1024).toFixed(0)} KB` : "No file · fixture mode"}
+                            </p>
+                          </div>
+                          {/* Type */}
+                          <div className="flex flex-col gap-1">
+                            <span className="text-[10px] font-semibold uppercase tracking-[0.16em] text-[var(--muted)]">Type</span>
+                            <select
+                              value={document.declaredType}
+                              onChange={(event) => setDraft((current) => ({
+                                ...current,
+                                documents: current.documents.map((item) =>
+                                  item.id === document.id ? { ...item, declaredType: event.target.value as DocumentType } : item
+                                )
+                              }))}
+                              className="field py-1.5 text-xs"
+                            >
+                              {["PRESCRIPTION","HOSPITAL_BILL","LAB_REPORT","DIAGNOSTIC_REPORT","PHARMACY_BILL","DISCHARGE_SUMMARY","DENTAL_REPORT","UNKNOWN"].map((opt) => (
+                                <option key={opt} value={opt}>{opt.replace(/_/g, " ")}</option>
+                              ))}
+                            </select>
+                          </div>
+                          {/* Quality */}
+                          <div className="flex flex-col gap-1">
+                            <span className="text-[10px] font-semibold uppercase tracking-[0.16em] text-[var(--muted)]">Quality</span>
+                            <select
+                              value={document.quality}
+                              onChange={(event) => setDraft((current) => ({
+                                ...current,
+                                documents: current.documents.map((item) =>
+                                  item.id === document.id ? { ...item, quality: event.target.value as DocumentDraft["quality"] } : item
+                                )
+                              }))}
+                              className="field py-1.5 text-xs"
+                            >
+                              {["GOOD","LOW","UNREADABLE","UNKNOWN"].map((opt) => (
+                                <option key={opt} value={opt}>{opt}</option>
+                              ))}
+                            </select>
+                          </div>
+                          {/* Remove */}
+                          <button
+                            type="button"
+                            onClick={() => setDraft((current) => ({
+                              ...current,
+                              documents: current.documents.filter((item) => item.id !== document.id)
+                            }))}
+                            className="mt-1 flex h-8 w-8 shrink-0 items-center justify-center rounded-full border border-[color:var(--line)] text-[var(--muted)] transition hover:border-[#dfb2a0] hover:text-[var(--ink)]"
+                          >
+                            <XCircle className="h-4 w-4" />
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  {/* Fixture mode helper */}
+                  <div className="flex items-center justify-between gap-3">
+                    <button
+                      type="button"
+                      onClick={() => setDraft((current) => ({
+                        ...current,
+                        documents: [...current.documents, { id: `doc-${Date.now()}`, file: null, declaredType: "HOSPITAL_BILL", patientName: "", quality: "UNKNOWN" }]
+                      }))}
+                      className="text-xs font-medium text-[var(--muted)] underline-offset-2 hover:text-[var(--plum)] hover:underline"
+                    >
+                      + Add fixture document (no file, demo mode)
+                    </button>
+                    <button
+                      type="button"
+                      disabled={draft.documents.length === 0}
+                      onClick={() => setSubmitStep("details")}
+                      className="inline-flex items-center gap-2 rounded-full bg-[var(--plum)] px-5 py-2.5 text-sm font-semibold text-white transition hover:opacity-95 disabled:cursor-not-allowed disabled:opacity-40"
+                    >
+                      Continue to details
+                      <ArrowRight className="h-4 w-4" />
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {/* ── STEP 2: Details ── */}
+              {submitStep === "details" && (
+                <div className="space-y-5">
+                  {/* Back */}
+                  <button
+                    type="button"
+                    onClick={() => setSubmitStep("upload")}
+                    className="inline-flex items-center gap-1.5 text-sm font-medium text-[var(--muted)] transition hover:text-[var(--plum)]"
+                  >
+                    <ArrowLeft className="h-4 w-4" />
+                    Back to documents
+                  </button>
+
+                  {/* Extraction notice */}
+                  {draft.documents.some((d) => d.file) && (
+                    <div className="flex items-start gap-3 rounded-[14px] border border-[#c2e8d4] bg-[#edf8f2] p-3.5">
+                      <Sparkles className="mt-0.5 h-4 w-4 shrink-0 text-[#1f8f5c]" />
+                      <div>
+                        <p className="text-sm font-semibold text-[#166b44]">
+                          {draft.documents.filter((d) => d.file).length} document{draft.documents.filter((d) => d.file).length > 1 ? "s" : ""} uploaded — type detected automatically
+                        </p>
+                        <p className="mt-0.5 text-xs text-[#1f8f5c]">
+                          Full field extraction happens on submission. Verify the details below before submitting.
+                        </p>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Form */}
+                  <div className="grid gap-4 md:grid-cols-2">
+                    <Field label="Member ID">
+                      <input value={draft.memberId} onChange={(e) => setDraft((c) => ({ ...c, memberId: e.target.value }))} className="field" placeholder="EMP001" />
+                    </Field>
+                    <Field label="Policy ID">
+                      <input value={draft.policyId} onChange={(e) => setDraft((c) => ({ ...c, policyId: e.target.value }))} className="field" placeholder="PLUM_GHI_2024" />
+                    </Field>
+                    <Field label="Claim category">
+                      <select value={draft.claimCategory} onChange={(e) => setDraft((c) => ({ ...c, claimCategory: e.target.value as ClaimCategory }))} className="field">
+                        {["CONSULTATION","DIAGNOSTIC","PHARMACY","DENTAL","VISION","ALTERNATIVE_MEDICINE"].map((opt) => (
+                          <option key={opt} value={opt}>{opt.replace(/_/g, " ")}</option>
+                        ))}
+                      </select>
+                    </Field>
+                    <Field label="Treatment date">
+                      <input type="date" value={draft.treatmentDate} onChange={(e) => setDraft((c) => ({ ...c, treatmentDate: e.target.value }))} className="field" />
+                    </Field>
+                    <Field label="Claimed amount (INR)">
+                      <input type="number" min="1" value={draft.claimedAmount} onChange={(e) => setDraft((c) => ({ ...c, claimedAmount: e.target.value }))} className="field" />
+                    </Field>
+                    <Field label="Year-to-date amount">
+                      <input type="number" min="0" value={draft.ytdClaimsAmount} onChange={(e) => setDraft((c) => ({ ...c, ytdClaimsAmount: e.target.value }))} className="field" placeholder="Optional" />
+                    </Field>
+                    <Field label="Hospital name">
+                      <input value={draft.hospitalName} onChange={(e) => setDraft((c) => ({ ...c, hospitalName: e.target.value }))} className="field" placeholder="Optional" />
+                    </Field>
+                  </div>
+
+                  {/* Per-document patient name */}
+                  <div className="space-y-2">
+                    <p className="text-xs font-semibold uppercase tracking-[0.18em] text-[var(--muted)]">Patient name on each document</p>
+                    {draft.documents.map((document, index) => (
+                      <div key={document.id} className="flex items-center gap-3 rounded-[14px] border border-[color:var(--line)] bg-[#fffaf2] p-3">
+                        <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-[var(--plum)]/10 text-[var(--plum)]">
+                          <FileText className="h-4 w-4" />
+                        </div>
+                        <div className="min-w-0 flex-1">
+                          <p className="truncate text-xs font-medium text-[var(--ink)]">
+                            {document.file ? document.file.name : `Fixture · ${document.declaredType.replace(/_/g, " ")}`}
+                          </p>
+                        </div>
+                        <input
+                          value={document.patientName}
+                          onChange={(e) => setDraft((current) => ({
+                            ...current,
+                            documents: current.documents.map((item) =>
+                              item.id === document.id ? { ...item, patientName: e.target.value } : item
+                            )
+                          }))}
+                          className="field w-48 py-1.5 text-sm"
+                          placeholder={`Patient name (doc ${index + 1})`}
+                        />
+                      </div>
+                    ))}
+                  </div>
+
+                  {/* Submit row */}
+                  <div className="flex flex-wrap items-center justify-between gap-3 rounded-[18px] border border-[color:var(--line)] bg-[#fffaf2] p-4">
+                    <p className="text-sm text-[var(--muted)]">{statusMessage}</p>
+                    <button
+                      type="button"
+                      onClick={() => startTransition(() => handleSubmitClaim())}
+                      disabled={loading === "submit"}
+                      className="inline-flex items-center justify-center gap-2 rounded-full bg-[var(--plum)] px-5 py-3 text-sm font-semibold text-white transition hover:opacity-95 disabled:cursor-not-allowed disabled:opacity-70"
+                    >
+                      {loading === "submit" ? <Loader2 className="h-4 w-4 animate-spin" /> : <UploadCloud className="h-4 w-4" />}
+                      Submit for review
+                    </button>
+                  </div>
+                </div>
+              )}
             </Panel>
           </div>
 
-          <div className={view === "decision" ? "space-y-6" : "space-y-6"}>
+          <div className={view === "decision" ? "space-y-6" : "hidden"}>
             <Panel title="Decision review" icon={<BadgeCheck className="h-4 w-4" />}>
               <div className="grid gap-4 md:grid-cols-[0.78fr_1.22fr]">
                 <div className="rounded-[22px] border border-[color:var(--line)] bg-[linear-gradient(180deg,#1d0716,#351325)] p-5 text-white">
