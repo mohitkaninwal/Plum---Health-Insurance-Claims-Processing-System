@@ -4,7 +4,6 @@ import logging
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from contextvars import ContextVar
 
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -13,6 +12,7 @@ from app.api.claims import router as claims_router
 from app.api.eval import router as eval_router
 from app.api.health import router as health_router
 from app.core.config import settings
+from app.core.context import request_id_var
 from app.services.policy_loader import load_policy_terms_on_startup
 
 # ── Structured JSON logging ───────────────────────────────────────────────────
@@ -34,14 +34,21 @@ except ImportError:
 log_level = getattr(logging, settings.log_level.upper(), logging.INFO)
 logging.root.setLevel(log_level)
 
-# ── Request-ID context variable ───────────────────────────────────────────────
-
-request_id_var: ContextVar[str | None] = ContextVar("request_id", default=None)
+logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.policy_terms = load_policy_terms_on_startup()
+    # NOTE: sentence-transformers (torch) is NOT preloaded here.
+    # Loading torch at startup would consume 300–450 MB on Linux and OOM
+    # Render's 512 MB free tier before the first request arrives.
+    # When ENABLE_EMBEDDINGS=true the model is loaded lazily on the first
+    # policy-retrieval call; when false (default) the SHA-256 fallback is used.
+    if settings.enable_embeddings:
+        logger.info("Embeddings enabled (ENABLE_EMBEDDINGS=true); model will load on first use.")
+    else:
+        logger.info("Embeddings disabled (ENABLE_EMBEDDINGS=false); SHA-256 fallback active.")
     yield
 
 

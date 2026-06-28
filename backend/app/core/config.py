@@ -26,6 +26,13 @@ class Settings(BaseSettings):
     groq_api_key: str = Field(default="", validation_alias="GROQ_API_KEY")
     cors_origins_raw: str = Field(default="http://localhost:3000", validation_alias="CORS_ORIGINS")
 
+    # sentence-transformers (torch) uses 300–450 MB of RSS on Linux.
+    # Keep this False on memory-constrained hosts (e.g. Render free tier, 512 MB).
+    # When False the SHA-256 fallback in policy_retriever.embed_text() is used;
+    # retrieval still works but loses semantic similarity ranking.
+    # Set ENABLE_EMBEDDINGS=true only on instances with ≥ 1 GB RAM.
+    enable_embeddings: bool = Field(default=False, validation_alias="ENABLE_EMBEDDINGS")
+
     @property
     def cors_origins(self) -> list[str]:
         return [origin.strip() for origin in self.cors_origins_raw.split(",") if origin.strip()]

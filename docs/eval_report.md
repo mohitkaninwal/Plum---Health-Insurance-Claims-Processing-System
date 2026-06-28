@@ -1,7 +1,7 @@
 # Eval Report
 
-Generated: 2026-06-28 11:18 UTC  
-Eval run ID: `EVAL_D380D9698A0A`  
+Generated: 2026-06-28 12:04 UTC  
+Eval run ID: `EVAL_F8A228760544`  
 Cases: 12/12
 
 ## Aggregate Metrics
@@ -252,7 +252,7 @@ Cases: 12/12
 7. `PatientConsistencyAgent` [INFO] — Extracted patient identity fields are consistent or unavailable.
 8. `RuleEngine` [WARNING] (-0.21) — Claim on hold — Pre-Authorization Approval required.
 
-Your Diagnostic claim (Claim ID: CLM_F8C5E3BE2FD9) includes a procedure that requires
+Your Diagnostic claim (Claim ID: CLM_80AF81B3556A) includes a procedure that requires
 prior approval from the insurer before reimbursement can be processed.
 
 Procedure detected: MRI
@@ -418,7 +418,7 @@ Policy Reference: Section 4 — Pre-Authorization Requirements
 7. `PatientConsistencyAgent` [INFO] — Extracted patient identity fields are consistent or unavailable.
 8. `PolicyEvidenceRetriever` [WARNING] (-0.12) — Recoverable component failure recorded; adjudication continued.
 9. `RuleEngine` [INFO] — Deterministic policy checks completed.
-10. `ConfidenceScorer` [INFO] (-0.23) — Final confidence score computed from document, extraction, policy, rule, and component signals.
+10. `ConfidenceScorer` [INFO] (-0.19) — Final confidence score computed from document, extraction, policy, rule, and component signals.
 11. `DecisionExplainer` [INFO] — Decision explanation assembled for review.
 
 ---

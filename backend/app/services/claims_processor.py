@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -60,6 +61,62 @@ from app.services.rules.financial_rules import (
 from app.services.rules.fraud_rules import fraud_reason as _fraud_reason
 
 TEST_CASES_PATH = Path(__file__).resolve().parents[3] / "test_cases.json"
+
+
+# ── Rule-check helper ─────────────────────────────────────────────────────────
+
+
+@dataclass
+class _RuleContext:
+    """Captures all shared state needed to build a rejection response.
+
+    Passing this around eliminates the repetitive 10-argument pattern that
+    previously appeared verbatim for every rule check in process_claim().
+    """
+
+    submission: ClaimSubmission
+    trace: list[TraceEvent]
+    evidence: list[PolicyEvidence]
+    extracted_docs: list[ExtractedDocumentData]
+    component_failures: list[ComponentFailure]
+    claim_id: str | None = None
+
+
+def _reject_if(
+    reason: str | None,
+    code: str,
+    ctx: _RuleContext,
+    rule_certainty_impact: float = 0,
+) -> ClaimResponse | None:
+    """Return a rejection response if *reason* is non-empty, else None.
+
+    Replaces the repeated pattern::
+
+        if reason:
+            return _rejected(submission, trace, evidence, [code], reason,
+                             confidence=_confidence_score(..., rule_certainty_impact=X),
+                             component_failures=component_failures,
+                             extracted_document_data=extracted_docs)
+    """
+    if not reason:
+        return None
+    return _rejected(
+        ctx.submission,
+        ctx.trace,
+        ctx.evidence,
+        [code],
+        reason,
+        confidence=_confidence_score(
+            ctx.submission,
+            ctx.evidence,
+            ctx.extracted_docs,
+            ctx.component_failures,
+            rule_certainty_impact=rule_certainty_impact,
+        ),
+        component_failures=ctx.component_failures,
+        extracted_document_data=ctx.extracted_docs,
+        claim_id=ctx.claim_id,
+    )
 
 
 def process_claim(
@@ -155,6 +212,7 @@ def process_claim(
 
     member = _member_for(submission.member_id, policy)
     component_failures: list[ComponentFailure] = list(extraction_result.component_failures)
+
     patient_name_reason = _patient_name_matches_member_family_reason(
         submission,
         member,
@@ -173,87 +231,34 @@ def process_claim(
             component_failures=component_failures,
             extracted_document_data=extraction_result.extracted_documents,
         )
-    confidence = _confidence_score(
-        submission,
-        evidence,
-        extraction_result.extracted_documents,
-        component_failures,
+
+    # Build a shared context object so every rule check below can be expressed
+    # as a single _reject_if() call rather than a verbose 10-argument block.
+    ctx = _RuleContext(
+        submission=submission,
+        trace=trace,
+        evidence=evidence,
+        extracted_docs=extraction_result.extracted_documents,
+        component_failures=component_failures,
+        claim_id=claim_id,
     )
+
     if member is None:
-        return _rejected(
-            submission,
-            trace,
-            evidence,
-            ["MEMBER_NOT_FOUND"],
+        return _reject_if(
             f"Member {submission.member_id} is not listed under policy {policy.policy_id}.",
-            confidence=_confidence_score(
-                submission,
-                evidence,
-                extraction_result.extracted_documents,
-                component_failures,
-                rule_certainty_impact=-0.02,
-            ),
-            component_failures=component_failures,
-            extracted_document_data=extraction_result.extracted_documents,
+            "MEMBER_NOT_FOUND",
+            ctx,
+            rule_certainty_impact=-0.02,
         )
 
-    policy_validity_reason = _policy_validity_reason(submission, policy)
-    if policy_validity_reason:
-        return _rejected(
-            submission,
-            trace,
-            evidence,
-            ["POLICY_NOT_ACTIVE"],
-            policy_validity_reason,
-            confidence=_confidence_score(
-                submission,
-                evidence,
-                extraction_result.extracted_documents,
-                component_failures,
-                rule_certainty_impact=-0.02,
-            ),
-            component_failures=component_failures,
-            extracted_document_data=extraction_result.extracted_documents,
-        )
+    if resp := _reject_if(_policy_validity_reason(submission, policy), "POLICY_NOT_ACTIVE", ctx, rule_certainty_impact=-0.02):
+        return resp
 
-    submission_rules_reason = _submission_rules_reason(submission, policy, claim_id)
-    if submission_rules_reason:
-        return _rejected(
-            submission,
-            trace,
-            evidence,
-            ["SUBMISSION_RULE_FAILED"],
-            submission_rules_reason,
-            confidence=_confidence_score(
-                submission,
-                evidence,
-                extraction_result.extracted_documents,
-                component_failures,
-                rule_certainty_impact=-0.03,
-            ),
-            component_failures=component_failures,
-            extracted_document_data=extraction_result.extracted_documents,
-            claim_id=claim_id,
-        )
+    if resp := _reject_if(_submission_rules_reason(submission, policy, claim_id), "SUBMISSION_RULE_FAILED", ctx, rule_certainty_impact=-0.03):
+        return resp
 
-    category_reason = _category_coverage_reason(submission, policy)
-    if category_reason:
-        return _rejected(
-            submission,
-            trace,
-            evidence,
-            ["CATEGORY_NOT_COVERED"],
-            category_reason,
-            confidence=_confidence_score(
-                submission,
-                evidence,
-                extraction_result.extracted_documents,
-                component_failures,
-                rule_certainty_impact=-0.03,
-            ),
-            component_failures=component_failures,
-            extracted_document_data=extraction_result.extracted_documents,
-        )
+    if resp := _reject_if(_category_coverage_reason(submission, policy), "CATEGORY_NOT_COVERED", ctx, rule_certainty_impact=-0.03):
+        return resp
 
     # simulate_failure comes from X-Simulate-Failure header (not the submission model)
     if simulate_failure:
@@ -262,13 +267,6 @@ def process_claim(
                 component="PolicyEvidenceRetriever",
                 message="Hybrid retrieval timed out; deterministic policy checks continued.",
             )
-        )
-        confidence = _confidence_score(
-            submission,
-            evidence,
-            extraction_result.extracted_documents,
-            component_failures,
-            rule_certainty_impact=-0.04,
         )
         trace.append(
             TraceEvent(
@@ -283,82 +281,17 @@ def process_claim(
 
     text = _claim_text(submission)
 
-    exclusion_reason = _exclusion_reason(text, policy)
-    if exclusion_reason:
-        return _rejected(
-            submission,
-            trace,
-            evidence,
-            ["EXCLUDED_CONDITION"],
-            exclusion_reason,
-            confidence=_confidence_score(
-                submission,
-                evidence,
-                extraction_result.extracted_documents,
-                component_failures,
-                rule_certainty_impact=0.05,
-            ),
-            component_failures=component_failures,
-            extracted_document_data=extraction_result.extracted_documents,
-        )
+    if resp := _reject_if(_exclusion_reason(text, policy), "EXCLUDED_CONDITION", ctx, rule_certainty_impact=0.05):
+        return resp
 
-    vision_exclusion_reason = _vision_exclusion_reason(submission, text, policy)
-    if vision_exclusion_reason:
-        return _rejected(
-            submission,
-            trace,
-            evidence,
-            ["EXCLUDED_VISION_ITEM"],
-            vision_exclusion_reason,
-            confidence=_confidence_score(
-                submission,
-                evidence,
-                extraction_result.extracted_documents,
-                component_failures,
-                rule_certainty_impact=0.05,
-            ),
-            component_failures=component_failures,
-            extracted_document_data=extraction_result.extracted_documents,
-        )
+    if resp := _reject_if(_vision_exclusion_reason(submission, text, policy), "EXCLUDED_VISION_ITEM", ctx, rule_certainty_impact=0.05):
+        return resp
 
-    waiting_reason = _waiting_period_reason(submission, member, text, policy)
-    if waiting_reason:
-        return _rejected(
-            submission,
-            trace,
-            evidence,
-            ["WAITING_PERIOD"],
-            waiting_reason,
-            confidence=_confidence_score(
-                submission,
-                evidence,
-                extraction_result.extracted_documents,
-                component_failures,
-                rule_certainty_impact=-0.07,
-            ),
-            component_failures=component_failures,
-            extracted_document_data=extraction_result.extracted_documents,
-        )
+    if resp := _reject_if(_waiting_period_reason(submission, member, text, policy), "WAITING_PERIOD", ctx, rule_certainty_impact=-0.07):
+        return resp
 
-    pre_auth_reason = _pre_auth_reason(submission, policy, claim_id)
-    if pre_auth_reason:
-        return _rejected(
-            submission,
-            trace,
-            evidence,
-            ["PRE_AUTH_MISSING"],
-            pre_auth_reason,
-            confidence=_confidence_score(
-                submission,
-                evidence,
-                extraction_result.extracted_documents,
-                component_failures,
-                rule_certainty_impact=-0.08,
-            ),
-            component_failures=component_failures,
-            extracted_document_data=extraction_result.extracted_documents,
-            claim_id=claim_id,
-        )
+    if resp := _reject_if(_pre_auth_reason(submission, policy, claim_id), "PRE_AUTH_MISSING", ctx, rule_certainty_impact=-0.08):
+        return resp
 
     fraud_reason_msg = _fraud_reason(submission, policy)
     if fraud_reason_msg:
@@ -394,49 +327,19 @@ def process_claim(
             extraction_result.extracted_documents,
         )
 
-    if (
-        submission.claimed_amount > policy.coverage.per_claim_limit
-        and submission.claim_category != "DENTAL"
-    ):
-        return _rejected(
-            submission,
-            trace,
-            evidence,
-            ["PER_CLAIM_EXCEEDED"],
-            (
-                f"Claimed amount INR {submission.claimed_amount:.0f} exceeds the per-claim "
-                f"limit of INR {policy.coverage.per_claim_limit:.0f}."
-            ),
-            confidence=_confidence_score(
-                submission,
-                evidence,
-                extraction_result.extracted_documents,
-                component_failures,
-                rule_certainty_impact=-0.06,
-            ),
-            component_failures=component_failures,
-            extracted_document_data=extraction_result.extracted_documents,
-        )
+    per_claim_reason = (
+        f"Claimed amount INR {submission.claimed_amount:.0f} exceeds the per-claim "
+        f"limit of INR {policy.coverage.per_claim_limit:.0f}."
+        if submission.claimed_amount > policy.coverage.per_claim_limit and submission.claim_category != "DENTAL"
+        else None
+    )
+    if resp := _reject_if(per_claim_reason, "PER_CLAIM_EXCEEDED", ctx, rule_certainty_impact=-0.06):
+        return resp
 
-    annual_limit_reason = _annual_limit_reason(submission, policy)
-    if annual_limit_reason:
-        return _rejected(
-            submission,
-            trace,
-            evidence,
-            ["ANNUAL_OPD_LIMIT_EXCEEDED"],
-            annual_limit_reason,
-            confidence=_confidence_score(
-                submission,
-                evidence,
-                extraction_result.extracted_documents,
-                component_failures,
-                rule_certainty_impact=-0.06,
-            ),
-            component_failures=component_failures,
-            extracted_document_data=extraction_result.extracted_documents,
-        )
+    if resp := _reject_if(_annual_limit_reason(submission, policy), "ANNUAL_OPD_LIMIT_EXCEEDED", ctx, rule_certainty_impact=-0.06):
+        return resp
 
+    confidence = _confidence_score(submission, evidence, extraction_result.extracted_documents, component_failures)
     decision = _approve_or_partially_approve(submission, policy, confidence)
     if component_failures:
         decision.reason += " Manual review is recommended because processing completed with warnings."

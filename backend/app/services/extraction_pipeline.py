@@ -5,6 +5,7 @@ import difflib
 import io
 import json
 import logging
+import time
 from collections import OrderedDict
 from datetime import datetime
 import re
@@ -12,9 +13,37 @@ from typing import Any, NotRequired, TypedDict
 
 logger = logging.getLogger(__name__)
 
-# ── Extraction cache (improvement 6) ─────────────────────────────────────────
+_GROQ_RETRY_ATTEMPTS = 3
+_GROQ_RETRY_BASE_DELAY = 1.0  # seconds; doubles on each attempt
+
+
+def _groq_retryable(exc: Exception) -> bool:
+    """Return True for transient Groq errors that are safe to retry."""
+    cls_name = type(exc).__name__
+    # Retry on rate-limit (429), service unavailable (503), and network errors.
+    # Do NOT retry on authentication errors, validation errors, or other 4xx.
+    retryable_names = {"RateLimitError", "ServiceUnavailableError", "APIConnectionError", "APITimeoutError"}
+    if cls_name in retryable_names:
+        return True
+    # Some Groq client versions surface HTTP status codes as attributes.
+    status = getattr(exc, "status_code", None)
+    return status in {429, 500, 503}
+
+# ── Extraction cache ──────────────────────────────────────────────────────────
 _EXTRACTION_CACHE: OrderedDict[str, Any] = OrderedDict()
 _EXTRACTION_CACHE_MAX = 200
+
+# ── LangGraph compiled graph singleton ────────────────────────────────────────
+# Compiling the graph is non-trivial. Doing it once at first use (not on every
+# request) avoids the repeated compilation overhead.
+_COMPILED_GRAPH: Any = None
+
+
+def _get_compiled_graph() -> Any:
+    global _COMPILED_GRAPH
+    if _COMPILED_GRAPH is None:
+        _COMPILED_GRAPH = _build_graph()
+    return _COMPILED_GRAPH
 
 from pydantic import BaseModel, Field, ValidationError
 
@@ -70,7 +99,7 @@ def run_extraction_pipeline(submission: ClaimSubmission) -> ExtractionPipelineRe
     if preparsed is not None:
         return preparsed
 
-    graph = _build_graph()
+    graph = _get_compiled_graph()
     state = graph.invoke(
         {
             "submission": submission,
@@ -456,8 +485,14 @@ def _extract_from_uploaded_text(
                     confidence=payload.confidence,
                     warnings=payload.warnings,
                 )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning(
+                "Groq text-extraction refinement failed for %s (%s); "
+                "falling back to regex-parsed fields. error=%r",
+                document.file_id,
+                document_type,
+                exc,
+            )
 
     confidence = _parsed_text_confidence(document_type, parsed_fields, missing_fields)
     warnings = [f"Missing {field}." for field in missing_fields]
@@ -528,6 +563,33 @@ def _extract_with_groq(
         )
 
 
+def _call_groq_with_retry(client: Any, **kwargs: Any) -> Any:
+    """Call client.chat.completions.create with exponential-backoff retry.
+
+    Retries up to _GROQ_RETRY_ATTEMPTS times on transient errors (rate limits,
+    network failures, 5xx). Non-retryable errors (auth, validation) propagate
+    immediately so the caller can handle them without waiting.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(_GROQ_RETRY_ATTEMPTS):
+        try:
+            return client.chat.completions.create(**kwargs)
+        except Exception as exc:
+            if not _groq_retryable(exc):
+                raise
+            last_exc = exc
+            delay = _GROQ_RETRY_BASE_DELAY * (2**attempt)
+            logger.warning(
+                "Groq transient error on attempt %d/%d; retrying in %.1fs. error=%r",
+                attempt + 1,
+                _GROQ_RETRY_ATTEMPTS,
+                delay,
+                exc,
+            )
+            time.sleep(delay)
+    raise last_exc  # type: ignore[misc]
+
+
 def _request_groq_extraction(
     document_type: DocumentType, content_base64: str, content_type: str
 ) -> _LLMExtractionPayload:
@@ -552,7 +614,8 @@ def _request_groq_extraction(
         f"{_lab_exclusion}"
         f"The classified document_type is {document_type}."
     )
-    response = client.chat.completions.create(
+    response = _call_groq_with_retry(
+        client,
         model="meta-llama/llama-4-scout-17b-16e-instruct",
         messages=[
             {
@@ -572,7 +635,8 @@ def _request_groq_extraction(
     try:
         return _parse_llm_extraction_payload(raw)
     except (ValidationError, ValueError) as original_exc:
-        repair = client.chat.completions.create(
+        repair = _call_groq_with_retry(
+            client,
             model="llama-3.3-70b-versatile",
             messages=[
                 {
@@ -613,7 +677,8 @@ def _request_groq_text_extraction(document_type: DocumentType, text: str) -> _LL
         f"{_lab_exclusion}"
         f"The classified document_type is {document_type}. OCR text excerpt:\n{text[:12000]}"
     )
-    response = client.chat.completions.create(
+    response = _call_groq_with_retry(
+        client,
         model="meta-llama/llama-4-scout-17b-16e-instruct",
         messages=[{"role": "user", "content": prompt}],
         temperature=0,
@@ -622,7 +687,8 @@ def _request_groq_text_extraction(document_type: DocumentType, text: str) -> _LL
     try:
         return _parse_llm_extraction_payload(raw)
     except (ValidationError, ValueError) as original_exc:
-        repair = client.chat.completions.create(
+        repair = _call_groq_with_retry(
+            client,
             model="llama-3.3-70b-versatile",
             messages=[
                 {

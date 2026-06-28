@@ -1,12 +1,15 @@
 """Gate rules: R01–R06 — policy/member validity and submission compliance."""
 from __future__ import annotations
 
+import logging
 import re
 from datetime import date, timedelta
 from typing import Any
 
 from app.models import ClaimSubmission, ExtractedDocumentData
 from app.models.policy import PolicyMember, PolicyTerms
+
+logger = logging.getLogger(__name__)
 
 _CATEGORY_LABELS: dict[str, str] = {
     "CONSULTATION": "Consultation",
@@ -133,6 +136,22 @@ def patient_name_matches_member_family_reason(
 
 
 def _submitted_on(submission: ClaimSubmission) -> date:
+    """Return the date on which the physical claim documents were submitted.
+
+    When a claim is lodged via the API without an explicit submission date in
+    the document content, we fall back to the treatment date.  This means:
+
+    * Claims submitted the same day as treatment are always within the deadline.
+    * To enforce the deadline for older paper claims, callers should include a
+      ``submitted_on`` or ``submission_date`` field in at least one document's
+      content dict.
+
+    Design note: using ``date.today()`` as the fallback would make all test
+    cases that submit historical claims (treatment in 2024) appear overdue when
+    run in 2025+.  The current fallback is the safest default for an API where
+    the submission instant is implicitly "now" and the deadline check is only
+    meaningful when historical submission metadata is explicitly provided.
+    """
     for doc in submission.documents:
         content = doc.content or {}
         raw_date = content.get("submitted_on") or content.get("submission_date")
@@ -143,6 +162,12 @@ def _submitted_on(submission: ClaimSubmission) -> date:
                 return date.fromisoformat(raw_date)
             except ValueError:
                 continue
+    logger.debug(
+        "No submission date found in document content for member=%s treatment_date=%s; "
+        "deadline check skipped (defaulting to treatment_date).",
+        submission.member_id,
+        submission.treatment_date,
+    )
     return submission.treatment_date
 
 

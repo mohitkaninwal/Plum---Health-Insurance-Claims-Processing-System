@@ -12,6 +12,7 @@ from sqlalchemy import delete, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.db.models import PolicyKnowledgeChunkRecord
 from app.db.session import SessionLocal
 from app.models.contracts import ClaimCategory, ClaimSubmission, PolicyEvidence
@@ -27,10 +28,24 @@ _sentence_model_loaded = False
 
 
 def _get_sentence_model():
+    """Return the sentence-transformer model, or None if embeddings are disabled.
+
+    sentence-transformers pulls in PyTorch which consumes 300–450 MB of RSS on
+    Linux.  When ``ENABLE_EMBEDDINGS`` is False (the default) we skip the import
+    entirely and the SHA-256 fallback in ``embed_text`` is used instead.
+
+    To enable real semantic embeddings set ``ENABLE_EMBEDDINGS=true`` in the
+    environment.  Only do this on instances with at least 1 GB of available RAM
+    (Render Standard plan or equivalent).
+    """
     global _sentence_model, _sentence_model_loaded
     if _sentence_model_loaded:
         return _sentence_model
     _sentence_model_loaded = True
+    if not settings.enable_embeddings:
+        # Fast path: skip torch import entirely to keep RSS well below 512 MB.
+        _sentence_model = None
+        return None
     try:
         from sentence_transformers import SentenceTransformer  # type: ignore[import-untyped]
         _sentence_model = SentenceTransformer("all-MiniLM-L6-v2")

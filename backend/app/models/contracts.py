@@ -7,6 +7,8 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from app.core.context import request_id_var
+
 
 class ClaimCategory(StrEnum):
     CONSULTATION = "CONSULTATION"
@@ -208,6 +210,13 @@ class TraceEvent(BaseModel):
     confidence_impact: float = 0
     warnings: list[str] = Field(default_factory=list)
     errors: list[str] = Field(default_factory=list)
+
+    def model_post_init(self, __context: Any) -> None:
+        # Auto-inject the current HTTP request ID when not explicitly provided.
+        # This ensures every trace event can be correlated back to the originating
+        # HTTP request without requiring every call site to pass the value manually.
+        if self.request_id is None:
+            self.request_id = request_id_var.get()
 
 
 class ClaimDecision(BaseModel):

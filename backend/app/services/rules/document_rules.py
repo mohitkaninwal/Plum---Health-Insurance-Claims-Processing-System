@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+from datetime import date
 from typing import Any
 from uuid import uuid4
 
@@ -241,6 +242,24 @@ def validate_documents(
             retrieved_policy_evidence=evidence,
         )
 
+    # ── Temporal sanity check (soft warning, not a hard stop) ────────────────
+    # If any document's invoice_date is more than 30 days *before* the claimed
+    # treatment_date it is likely a stale or mis-scanned document.  We do not
+    # reject the claim — bills and lab reports can carry earlier dates — but we
+    # surface the discrepancy in the trace so reviewers are aware.
+    date_warnings = _invoice_date_warnings(submission)
+    if date_warnings:
+        trace.append(
+            TraceEvent(
+                component="DocumentVerifierAgent",
+                level=TraceLevel.WARNING,
+                message="One or more document dates are more than 30 days before the treatment date.",
+                output_summary={"date_discrepancies": date_warnings},
+                checks_performed=["invoice_date_vs_treatment_date"],
+                warnings=date_warnings,
+            )
+        )
+
     trace.append(
         TraceEvent(
             component="DocumentVerifierAgent",
@@ -252,6 +271,7 @@ def validate_documents(
                 "readability_check",
                 "supported_document_type_check",
                 "patient_consistency_check",
+                "invoice_date_vs_treatment_date",
             ],
             evidence_ids=[item.evidence_id for item in evidence if item.rule_category == "document_requirements"],
         )
@@ -432,6 +452,38 @@ def _msg_wrong_doc_type(
         f"Your uploaded file has been retained and may count as a supporting document\n"
         f"if applicable. Please add the correct document and resubmit."
     )
+
+
+def _invoice_date_warnings(submission: ClaimSubmission) -> list[str]:
+    """Return a warning string for each document whose invoice_date is more
+    than 30 days before the treatment date.  Documents with no invoice_date or
+    an unparseable date are silently skipped.
+    """
+    warnings: list[str] = []
+    treatment = submission.treatment_date
+    for doc in submission.documents:
+        content = doc.content or {}
+        raw_date = content.get("invoice_date") or content.get("parsed_fields", {}).get("invoice_date")
+        if not raw_date:
+            continue
+        parsed: date | None = None
+        if isinstance(raw_date, date) and not isinstance(raw_date, type(None)):
+            parsed = raw_date
+        elif isinstance(raw_date, str):
+            try:
+                parsed = date.fromisoformat(raw_date[:10])
+            except ValueError:
+                continue
+        if parsed is None:
+            continue
+        delta = (treatment - parsed).days
+        if delta > 30:
+            warnings.append(
+                f"Document '{doc.file_name or doc.file_id}' has invoice_date {parsed.isoformat()}, "
+                f"which is {delta} days before the treatment date {treatment.isoformat()}. "
+                "Please verify this document belongs to the current claim."
+            )
+    return warnings
 
 
 def _msg_unreadable(claim_id: str, claim_category: str, filename: str) -> str:

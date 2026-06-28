@@ -32,7 +32,9 @@ def vision_exclusion_reason(submission: ClaimSubmission, text: str, policy: Poli
     for term in policy.exclusions.vision_exclusions:
         if term.lower() in text:
             return f"Vision item is excluded under policy exclusion: {term}."
-    config = policy.opd_categories["vision"]
+    config = policy.opd_categories.get("vision")
+    if config is None:
+        return None
     for item in config.excluded_items or []:
         if item.lower() in text:
             return f"Vision item is excluded under category rule: {item}."
@@ -62,7 +64,9 @@ def waiting_period_reason(
 
 
 def pre_auth_reason(submission: ClaimSubmission, policy: PolicyTerms, claim_id: str) -> str | None:
-    config = policy.opd_categories[submission.claim_category.lower()]
+    config = policy.opd_categories.get(submission.claim_category.lower())
+    if config is None:
+        return None
     high_value_tests = config.high_value_tests_requiring_pre_auth or []
     if not high_value_tests or config.pre_auth_threshold is None:
         return None
@@ -77,6 +81,9 @@ def pre_auth_reason(submission: ClaimSubmission, policy: PolicyTerms, claim_id: 
 
 
 def annual_limit_reason(submission: ClaimSubmission, policy: PolicyTerms) -> str | None:
+    # coverage.annual_opd_limit of 0 means no OPD coverage — skip the check.
+    if not policy.coverage.annual_opd_limit:
+        return None
     ytd_claims = submission.ytd_claims_amount or 0
     projected_total = ytd_claims + submission.claimed_amount
     if projected_total > policy.coverage.annual_opd_limit:
