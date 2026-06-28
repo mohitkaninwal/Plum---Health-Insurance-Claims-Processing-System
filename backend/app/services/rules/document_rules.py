@@ -154,7 +154,7 @@ def validate_documents(
         member_name_str = _member_name(submission, policy)
         uploaded_type_names = " and ".join(str(t) for t in uploaded_types) if uploaded_types else "no recognised"
         if len(missing) == 1:
-            detail = _detailed_missing_doc_message(missing[0], submission.claim_category, val_claim_id, member_name_str)
+            detail = _detailed_missing_doc_message(missing[0], submission.claim_category, val_claim_id, member_name_str, policy.submission_rules.deadline_days_from_treatment)
             short_msg = (
                 f"A {str(missing[0])} document is required for {str(submission.claim_category)} claims, "
                 f"but only {uploaded_type_names} documents were uploaded."
@@ -243,17 +243,18 @@ def validate_documents(
         )
 
     # ── Temporal sanity check (soft warning, not a hard stop) ────────────────
-    # If any document's invoice_date is more than 30 days *before* the claimed
-    # treatment_date it is likely a stale or mis-scanned document.  We do not
-    # reject the claim — bills and lab reports can carry earlier dates — but we
-    # surface the discrepancy in the trace so reviewers are aware.
-    date_warnings = _invoice_date_warnings(submission)
+    # If any document's invoice_date is more than the policy deadline *before*
+    # the claimed treatment_date it is likely a stale or mis-scanned document.
+    # We do not reject the claim — bills and lab reports can carry earlier
+    # dates — but we surface the discrepancy in the trace so reviewers are aware.
+    deadline_days = policy.submission_rules.deadline_days_from_treatment
+    date_warnings = _invoice_date_warnings(submission, deadline_days)
     if date_warnings:
         trace.append(
             TraceEvent(
                 component="DocumentVerifierAgent",
                 level=TraceLevel.WARNING,
-                message="One or more document dates are more than 30 days before the treatment date.",
+                message=f"One or more document dates are more than {deadline_days} days before the treatment date.",
                 output_summary={"date_discrepancies": date_warnings},
                 checks_performed=["invoice_date_vs_treatment_date"],
                 warnings=date_warnings,
@@ -309,17 +310,18 @@ def _detailed_missing_doc_message(
     claim_category: str,
     claim_id: str,
     member_name: str,
+    deadline_days: int = 30,
 ) -> str:
     dt = str(doc_type).upper()
     category_label = _readable_category(claim_category)
     if dt == "PRESCRIPTION":
-        return _msg_missing_prescription(claim_id, category_label, member_name)
+        return _msg_missing_prescription(claim_id, category_label, member_name, deadline_days)
     if dt == "HOSPITAL_BILL":
         return _msg_missing_hospital_bill(claim_id, category_label)
     if dt in ("LAB_REPORT", "DIAGNOSTIC_REPORT"):
         return _msg_missing_lab_report(claim_id)
     if dt == "PHARMACY_BILL":
-        return _msg_missing_pharmacy_bill(claim_id)
+        return _msg_missing_pharmacy_bill(claim_id, deadline_days)
     missing_label = _readable_doc_type(dt)
     return (
         f"Claim cannot proceed \u2014 {missing_label} missing.\n\n"
@@ -340,7 +342,7 @@ def _msg_multiple_missing(missing: list, claim_id: str, claim_category: str) -> 
     )
 
 
-def _msg_missing_prescription(claim_id: str, claim_category: str, member_name: str) -> str:
+def _msg_missing_prescription(claim_id: str, claim_category: str, member_name: str, deadline_days: int = 30) -> str:
     return (
         f"Claim cannot proceed — Doctor's Prescription missing.\n\n"
         f"Your {claim_category} claim (Claim ID: {claim_id}) requires a valid doctor's prescription\n"
@@ -349,13 +351,13 @@ def _msg_missing_prescription(claim_id: str, claim_category: str, member_name: s
         f"  \u2713 Issued by an MBBS or higher qualified doctor\n"
         f"  \u2713 Contains doctor's MCI/state registration number (e.g. KA/45678/2015)\n"
         f"  \u2713 Shows patient name matching your policy ({member_name})\n"
-        f"  \u2713 Dated within 30 days of treatment\n"
+        f"  \u2713 Dated within {deadline_days} days of treatment\n"
         f"  \u2713 Includes diagnosis and treatment advised\n\n"
         f"What does NOT qualify:\n"
         f"  \u2717 Pharmacy receipts or bills\n"
         f"  \u2717 Lab reports or diagnostic reports\n"
         f"  \u2717 Discharge summaries (unless they contain Rx)\n"
-        f"  \u2717 Prescriptions older than 30 days from treatment date\n\n"
+        f"  \u2717 Prescriptions older than {deadline_days} days from treatment date\n\n"
         f"Submit your claim again with the prescription attached.\n"
         f"If your doctor issued a digital prescription, a clear screenshot or PDF is accepted."
     )
@@ -403,7 +405,7 @@ def _msg_missing_lab_report(claim_id: str) -> str:
     )
 
 
-def _msg_missing_pharmacy_bill(claim_id: str) -> str:
+def _msg_missing_pharmacy_bill(claim_id: str, deadline_days: int = 30) -> str:
     return (
         f"Claim cannot proceed — Pharmacy Bill missing.\n\n"
         f"Your Pharmacy claim (Claim ID: {claim_id}) requires an itemised bill\n"
@@ -412,7 +414,7 @@ def _msg_missing_pharmacy_bill(claim_id: str) -> str:
         f"  \u2713 Bill from a pharmacy with a valid Drug Licence Number (e.g. KA-BLR-XXXX)\n"
         f"  \u2713 Lists each medicine by name, quantity, MRP, and amount charged\n"
         f"  \u2713 Shows pharmacist name or stamp\n"
-        f"  \u2713 Date of purchase within 30 days of prescription date\n\n"
+        f"  \u2713 Date of purchase within {deadline_days} days of prescription date\n\n"
         f"What does NOT qualify:\n"
         f'  \u2717 Hospital bill that mentions "medicines" as a lump sum\n'
         f"  \u2717 Online pharmacy order confirmation without itemised breakup\n"
@@ -454,10 +456,10 @@ def _msg_wrong_doc_type(
     )
 
 
-def _invoice_date_warnings(submission: ClaimSubmission) -> list[str]:
+def _invoice_date_warnings(submission: ClaimSubmission, deadline_days: int = 30) -> list[str]:
     """Return a warning string for each document whose invoice_date is more
-    than 30 days before the treatment date.  Documents with no invoice_date or
-    an unparseable date are silently skipped.
+    than *deadline_days* before the treatment date.  Documents with no
+    invoice_date or an unparseable date are silently skipped.
     """
     warnings: list[str] = []
     treatment = submission.treatment_date
@@ -477,7 +479,7 @@ def _invoice_date_warnings(submission: ClaimSubmission) -> list[str]:
         if parsed is None:
             continue
         delta = (treatment - parsed).days
-        if delta > 30:
+        if delta > deadline_days:
             warnings.append(
                 f"Document '{doc.file_name or doc.file_id}' has invoice_date {parsed.isoformat()}, "
                 f"which is {delta} days before the treatment date {treatment.isoformat()}. "
