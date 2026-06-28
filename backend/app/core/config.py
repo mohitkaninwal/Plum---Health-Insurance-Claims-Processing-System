@@ -22,6 +22,7 @@ class Settings(BaseSettings):
         if url.startswith("postgresql://") or url.startswith("postgres://"):
             url = url.replace("://", "+psycopg://", 1)
         return url
+    log_level: str = Field(default="INFO", validation_alias="LOG_LEVEL")
     groq_api_key: str = Field(default="", validation_alias="GROQ_API_KEY")
     cors_origins_raw: str = Field(default="http://localhost:3000", validation_alias="CORS_ORIGINS")
 

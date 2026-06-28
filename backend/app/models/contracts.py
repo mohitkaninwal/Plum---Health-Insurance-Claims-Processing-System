@@ -93,7 +93,6 @@ class ClaimSubmission(BaseModel):
     ytd_claims_amount: float | None = Field(default=None, ge=0)
     hospital_name: str | None = None
     claims_history: list[ClaimHistoryItem] = Field(default_factory=list)
-    simulate_component_failure: bool = False
 
 
 class DocumentClassification(BaseModel):
@@ -198,6 +197,7 @@ class ComponentFailure(BaseModel):
 
 class TraceEvent(BaseModel):
     timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    request_id: str | None = None
     component: str
     level: TraceLevel = TraceLevel.INFO
     message: str

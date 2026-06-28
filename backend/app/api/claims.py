@@ -9,10 +9,12 @@ from app.db.session import SessionLocal
 from app.models import (
     ClaimResponse,
     ClaimSubmission,
+    ComponentFailure,
     DocumentParseResult,
     MemberYtdSummary,
     PolicyContext,
     PolicyMemberSummary,
+    TraceEvent,
 )
 from app.services.claim_intake_repository import persist_claim_intake
 from app.services.claims_processor import process_claim
@@ -94,9 +96,11 @@ async def get_member_ytd(member_id: str, request: Request, as_of_date: str | Non
 )
 async def submit_claim(request: Request, submission: ClaimSubmission) -> ClaimResponse:
     policy = getattr(request.app.state, "policy_terms", None)
-    response = process_claim(submission, policy=policy)
+    simulate_failure = request.headers.get("X-Simulate-Failure", "").lower() == "true"
+    response = process_claim(submission, policy=policy, simulate_failure=simulate_failure)
     response = persist_claim_intake(response)
-    _CLAIMS[response.claim_id] = response
+    if SessionLocal is None:
+        _CLAIMS[response.claim_id] = response
     return response
 
 
@@ -110,11 +114,13 @@ async def submit_claim_upload(
     request: Request, form: Annotated[UploadDocumentForm, Depends()]
 ) -> ClaimResponse:
     policy = getattr(request.app.state, "policy_terms", None)
+    simulate_failure = request.headers.get("X-Simulate-Failure", "").lower() == "true"
     submission = await submission_from_upload_form(form)
-    response = process_claim(submission, policy=policy)
+    response = process_claim(submission, policy=policy, simulate_failure=simulate_failure)
     response = response_without_upload_payloads(response)
     response = persist_claim_intake(response)
-    _CLAIMS[response.claim_id] = response
+    if SessionLocal is None:
+        _CLAIMS[response.claim_id] = response
     return response
 
 
@@ -200,6 +206,15 @@ def _parse_as_of_date(value: str | None) -> date:
     summary="Fetch a claim response and trace by claim ID",
 )
 async def get_claim(claim_id: str) -> ClaimResponse:
+    if SessionLocal is not None:
+        db = SessionLocal()
+        try:
+            record = db.get(ClaimIntakeRecord, claim_id)
+            if record is not None:
+                return _claim_response_from_record(record)
+        finally:
+            db.close()
+
     claim = _CLAIMS.get(claim_id)
     if claim is None:
         raise HTTPException(
@@ -207,3 +222,27 @@ async def get_claim(claim_id: str) -> ClaimResponse:
             detail=f"Claim '{claim_id}' was not found.",
         )
     return claim
+
+
+def _claim_response_from_record(record: ClaimIntakeRecord) -> ClaimResponse:
+    from app.models import ClaimDecision, ClaimDecisionType, ClaimStatus
+    decision = None
+    if record.decision:
+        decision = ClaimDecision(
+            decision=ClaimDecisionType(record.decision),
+            approved_amount=record.approved_amount or 0,
+            confidence_score=record.confidence_score or 0,
+            reason=record.reason or "",
+            rejection_reasons=record.rejection_reasons or [],
+        )
+    return ClaimResponse(
+        claim_id=record.claim_id,
+        status=ClaimStatus(record.status),
+        decision=decision,
+        approved_amount=record.approved_amount,
+        confidence_score=record.confidence_score,
+        reason=record.reason,
+        rejection_reasons=record.rejection_reasons or [],
+        trace=[TraceEvent(**e) for e in (record.trace or [])],
+        component_failures=[ComponentFailure(**f) for f in (record.component_failures or [])],
+    )
