@@ -2,7 +2,11 @@ from __future__ import annotations
 
 from typing import Any
 
+import logging
+
 from sqlalchemy.exc import SQLAlchemyError
+
+logger = logging.getLogger(__name__)
 
 from app.core.config import settings
 from app.db.models import ClaimIntakeRecord, UploadedDocumentRecord
@@ -19,8 +23,9 @@ def persist_claim_intake(response: ClaimResponse) -> ClaimResponse:
     try:
         _replace_claim_intake(response, db)
         db.commit()
-    except SQLAlchemyError as exc:
+    except Exception as exc:
         db.rollback()
+        logger.error("ClaimIntakeRepository persist failed for claim %s: %r", response.claim_id, exc)
         if settings.environment.lower() in {"local", "test"}:
             return response
         response.component_failures.append(
