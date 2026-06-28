@@ -32,20 +32,7 @@ Accepts a claim submission (member details, treatment type, claimed amount, uplo
 ## System Architecture
 
 ### High-Level Layers
-
-```mermaid
-graph TB
-    A["PRESENTATION LAYER<br/>Next.js 15 · React 19 · TypeScript<br/>Submit Tab | Decision Tab | Eval Tab"]
-    B["API GATEWAY LAYER<br/>FastAPI · Python 3.11+<br/>/claims | /eval | /health"]
-    C["SERVICES LAYER<br/>Document Intake · Extraction Pipeline<br/>Policy Loader · Policy Retriever<br/>Claims Processor · Claim Intake Repository"]
-    D["DATA LAYER<br/>PostgreSQL + pgvector<br/>13 Tables · Vector Embeddings (64-dim)"]
-    E["EXTERNAL SERVICES<br/>Groq API — Llama 4 Scout Vision"]
-
-    A -->|REST API HTTP/JSON| B
-    B --> C
-    C --> D
-    C -->|Vision extraction| E
-```
+<img width="1469" height="1167" alt="diagram-export-28-06-2026-02_55_03" src="https://github.com/user-attachments/assets/5156e6b1-3719-492f-b872-4cbbedc472b6" />
 
 ### End-to-End Data Flow
 
