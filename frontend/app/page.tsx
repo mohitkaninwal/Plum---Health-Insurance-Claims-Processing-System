@@ -1492,6 +1492,51 @@ export default function Home() {
                             )}
                           </div>
                           <p className="mt-1 text-sm leading-5 text-[var(--muted)]">{event.message}</p>
+                          {/* Show output_summary details for key trace events */}
+                          {event.output_summary && Object.keys(event.output_summary).length > 0 && (() => {
+                            const os = event.output_summary as Record<string, unknown>;
+                            const reason = typeof os.reason === "string" ? os.reason : null;
+                            const lineItems = Array.isArray(os.line_item_decisions) ? (os.line_item_decisions as Array<{description: string; claimed_amount: number; approved_amount: number; decision: "APPROVED" | "REJECTED" | "ADJUSTED" | "REVIEW"; reason: string}>) : [];
+                            const rejReasons = Array.isArray(os.rejection_reasons) ? (os.rejection_reasons as string[]) : [];
+                            return (reason || lineItems.length > 0 || rejReasons.length > 0) ? (
+                              <details className="mt-2">
+                                <summary className="cursor-pointer text-[10px] font-semibold uppercase tracking-[0.14em] text-[var(--plum)] hover:underline">Details</summary>
+                                <div className="mt-2 space-y-2">
+                                  {reason && <p className="text-xs leading-5 text-[var(--ink)]">{reason}</p>}
+                                  {lineItems.length > 0 && (
+                                    <div className="space-y-1.5">
+                                      <p className="text-[9px] font-semibold uppercase tracking-[0.14em] text-[var(--muted)]">Line items</p>
+                                      {lineItems.map((li, liIdx) => (
+                                        <div key={`trace-li-${liIdx}`} className="flex flex-wrap items-center gap-2 rounded-lg border border-[color:var(--line)] bg-white/60 p-2 text-xs">
+                                          <span className="font-medium text-[var(--ink)]">{li.description}</span>
+                                          <span className="text-[var(--muted)]">Claimed: INR {Number(li.claimed_amount).toLocaleString("en-IN")}</span>
+                                          <span className="text-[var(--muted)]">Approved: INR {Number(li.approved_amount).toLocaleString("en-IN")}</span>
+                                          <LineBadge decision={li.decision} />
+                                          <span className="basis-full text-[11px] text-[var(--muted)]">{li.reason}</span>
+                                        </div>
+                                      ))}
+                                    </div>
+                                  )}
+                                  {rejReasons.length > 0 && (
+                                    <div className="flex flex-wrap gap-1.5">
+                                      <span className="text-[9px] font-semibold uppercase tracking-[0.14em] text-[var(--muted)]">Rejection reasons:</span>
+                                      {rejReasons.map((r) => (
+                                        <span key={r} className="rounded-full bg-[#ffe2df] px-2 py-0.5 text-[10px] font-semibold text-[#a83d35]">{r}</span>
+                                      ))}
+                                    </div>
+                                  )}
+                                </div>
+                              </details>
+                            ) : null;
+                          })()}
+                          {/* Show warnings inline */}
+                          {event.warnings && event.warnings.length > 0 && (
+                            <div className="mt-1.5 space-y-1">
+                              {event.warnings.map((w, wi) => (
+                                <p key={wi} className="text-xs text-[#9f5f17]">{w}</p>
+                              ))}
+                            </div>
+                          )}
                         </div>
                       </div>
                     ))
@@ -1740,9 +1785,43 @@ export default function Home() {
                                         <span className="font-medium text-[var(--ink)]">{item.actual.status}</span>
                                       </div>
                                     )}
+                                    {item.actual?.reason && (
+                                      <div className="mt-1 border-t border-[color:var(--line)] pt-1.5">
+                                        <p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-[var(--muted)]">Reason</p>
+                                        <p className="mt-0.5 whitespace-pre-line text-xs leading-5 text-[var(--ink)]">{item.actual.reason}</p>
+                                      </div>
+                                    )}
                                   </div>
                                 </div>
                               </div>
+                              {/* Line-item decisions */}
+                              {(() => {
+                                const lineItems = item.actual?.line_item_decisions ?? item.actual?.decision?.line_item_decisions ?? [];
+                                return lineItems.length > 0 ? (
+                                  <div className="space-y-2">
+                                    <p className="text-[10px] font-semibold uppercase tracking-[0.18em] text-[var(--muted)]">Line-item adjudication</p>
+                                    {lineItems.map((li, liIdx) => (
+                                      <div key={`${li.description}-${liIdx}`} className="grid items-center gap-2 rounded-[14px] border border-[color:var(--line)] bg-white p-3 sm:grid-cols-[1fr_auto_auto_auto]">
+                                        <div className="min-w-0">
+                                          <p className="text-xs font-medium text-[var(--ink)]">{li.description}</p>
+                                          <p className="mt-0.5 text-[11px] text-[var(--muted)]">{li.reason}</p>
+                                        </div>
+                                        <div className="text-right">
+                                          <p className="text-[9px] font-semibold uppercase tracking-[0.14em] text-[var(--muted)]">Claimed</p>
+                                          <p className="text-xs font-semibold text-[var(--ink)]">INR {li.claimed_amount.toLocaleString("en-IN")}</p>
+                                        </div>
+                                        <div className="text-right">
+                                          <p className="text-[9px] font-semibold uppercase tracking-[0.14em] text-[var(--muted)]">Approved</p>
+                                          <p className="text-xs font-semibold text-[var(--ink)]">INR {li.approved_amount.toLocaleString("en-IN")}</p>
+                                        </div>
+                                        <div className="flex justify-end">
+                                          <LineBadge decision={li.decision} />
+                                        </div>
+                                      </div>
+                                    ))}
+                                  </div>
+                                ) : null;
+                              })()}
                               {/* Trace events */}
                               {(item.actual?.trace?.length ?? 0) > 0 && (
                                 <div className="space-y-2">
@@ -1768,6 +1847,30 @@ export default function Home() {
                                             )}
                                           </div>
                                           <p className="mt-1 text-xs leading-5 text-[var(--muted)]">{event.message}</p>
+                                          {event.output_summary && Object.keys(event.output_summary).length > 0 && (() => {
+                                            const os = event.output_summary as Record<string, unknown>;
+                                            const reason = typeof os.reason === "string" ? os.reason : null;
+                                            const lineItems = Array.isArray(os.line_item_decisions) ? (os.line_item_decisions as Array<{description: string; claimed_amount: number; approved_amount: number; decision: "APPROVED" | "REJECTED" | "ADJUSTED" | "REVIEW"; reason: string}>) : [];
+                                            return (reason || lineItems.length > 0) ? (
+                                              <details className="mt-1.5">
+                                                <summary className="cursor-pointer text-[9px] font-semibold uppercase tracking-[0.14em] text-[var(--plum)] hover:underline">Details</summary>
+                                                <div className="mt-1.5 space-y-1.5">
+                                                  {reason && <p className="text-[11px] leading-5 text-[var(--ink)]">{reason}</p>}
+                                                  {lineItems.length > 0 && (
+                                                    <div className="space-y-1">
+                                                      {lineItems.map((li, liIdx) => (
+                                                        <div key={`eval-trace-li-${liIdx}`} className="flex flex-wrap items-center gap-1.5 rounded-lg border border-[color:var(--line)] bg-white/60 p-1.5 text-[11px]">
+                                                          <span className="font-medium text-[var(--ink)]">{li.description}</span>
+                                                          <span className="text-[var(--muted)]">INR {Number(li.claimed_amount).toLocaleString("en-IN")} → {Number(li.approved_amount).toLocaleString("en-IN")}</span>
+                                                          <LineBadge decision={li.decision} />
+                                                        </div>
+                                                      ))}
+                                                    </div>
+                                                  )}
+                                                </div>
+                                              </details>
+                                            ) : null;
+                                          })()}
                                         </div>
                                       </div>
                                     ))}
