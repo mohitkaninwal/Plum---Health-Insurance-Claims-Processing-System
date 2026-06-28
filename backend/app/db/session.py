@@ -6,7 +6,17 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.core.config import settings
 
 
-engine = create_engine(settings.database_url_psycopg3, pool_pre_ping=True) if settings.database_url else None
+engine = (
+    create_engine(
+        settings.database_url_psycopg3,
+        pool_pre_ping=True,
+        pool_recycle=300,  # recycle connections every 5 min (before Neon suspends at ~5 min)
+        pool_size=2,
+        max_overflow=2,
+    )
+    if settings.database_url
+    else None
+)
 
 SessionLocal = (
     sessionmaker(bind=engine, autocommit=False, autoflush=False, expire_on_commit=False)

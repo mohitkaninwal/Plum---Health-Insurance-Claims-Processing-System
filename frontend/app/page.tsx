@@ -266,6 +266,7 @@ export default function Home() {
   const [expandedCaseId, setExpandedCaseId] = useState<string | null>(null);
   const [statusMessage, setStatusMessage] = useState<string>("Upload documents to start.");
   const [loading, setLoading] = useState<"submit" | "eval" | null>(null);
+  const [ytdRefreshKey, setYtdRefreshKey] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [submitValidationError, setSubmitValidationError] = useState<ClaimResponse["member_action_required"] | null>(null);
   const [submitStep, setSubmitStep] = useState<"upload" | "details">("upload");
@@ -354,7 +355,7 @@ export default function Home() {
     return () => {
       cancelled = true;
     };
-  }, [draft.memberId, draft.treatmentDate, policyContext?.policy_id]);
+  }, [draft.memberId, draft.treatmentDate, policyContext?.policy_id, ytdRefreshKey]);
 
   function buildParseFormData(nextDraft: ClaimDraft): FormData {
     const formData = new FormData();
@@ -596,6 +597,7 @@ export default function Home() {
         setView("decision");
         setSubmitStep("upload");
         setStatusMessage(`Claim ${response.claim_id} returned ${response.status}.`);
+        setYtdRefreshKey((k) => k + 1);
       }
     } catch (submissionError) {
       setError(submissionError instanceof Error ? submissionError.message : "Submission failed");
