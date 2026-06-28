@@ -735,7 +735,61 @@ Layer 5: Component Failures
 
 ---
 
-## 16. KEY DESIGN DECISIONS
+## 16. TRADE-OFFS, LIMITATIONS & SCALING
+
+### What We Considered and Rejected
+
+| Option Considered | What We Chose Instead | Why We Rejected It |
+|---|---|---|
+| **LLM-based adjudication** (GPT-4 / Claude decides approve/reject) | Deterministic Python rules engine | Claims decisions must be auditable and reproducible. An LLM might produce different results for the same input, and "the model said so" is not an acceptable explanation for a rejected claim. Deterministic rules give us a 1:1 mapping from input → decision with a full audit trail. |
+| **OpenAI GPT-4V** for document extraction | Groq (Llama 4 Scout) | GPT-4V is slower (2-5s per call) and more expensive. Groq's inference speed (<500ms) matters when processing batches. Trade-off: Llama 4 Scout is less accurate on degraded handwritten docs, but the deterministic fallback catches extraction failures. |
+| **Dedicated vector database** (Pinecone, Weaviate) | pgvector extension in PostgreSQL | Adding a separate vector DB increases infra complexity for a policy corpus of ~20 chunks. pgvector handles this trivially. At 10x scale with thousands of policy variants, we'd revisit this. |
+| **Sentence-transformers embeddings** (all-MiniLM-L6-v2) | SHA256-based deterministic embeddings (default) | Real embeddings require PyTorch (~300-450 MB RAM). On Render's 512 MB free tier, this causes OOM at boot. SHA256 fallback preserves lexical search quality. Toggle: set `ENABLE_EMBEDDINGS=true` on >=1 GB instances. |
+| **Multi-model ensemble** (run 2-3 LLMs, vote on extraction) | Single LLM + deterministic validation | Ensemble would triple latency and cost. Instead, we validate LLM output with Pydantic schemas and post-processing filters — cheaper, faster, and equally reliable for structured extraction. |
+| **Celery / Redis task queue** for async processing | Synchronous FastAPI with `asyncio` | The current claim volume (75K/year ≈ 200/day) doesn't justify queue infrastructure. FastAPI's async handlers with Groq's fast inference keep P95 latency under 3 seconds. |
+| **Microservices** (separate services for extraction, rules, fraud) | Monolith with modular service layer | At current scale, network overhead between microservices would exceed the compute time. The 5-module rule engine (`gate_rules`, `document_rules`, `coverage_rules`, `financial_rules`, `fraud_rules`) gives us clean separation without deployment complexity. |
+| **React component library** (Shadcn, Radix) | Single-file Tailwind UI | For an internal ops tool with 3 tabs, a component library adds bundle size and learning curve with no proportional benefit. Trade-off: the 2,078-line `page.tsx` should be split into components if the UI grows. |
+| **Authentication / RBAC** | None | This is an internal ops tool. Auth adds real complexity (token management, session handling, role checks) with no value for the assignment scope. First thing to add in production. |
+| **OCR pre-processing** (Tesseract, Google Vision) | Direct LLM vision extraction | Modern vision LLMs handle OCR implicitly. A separate OCR step adds latency and another failure point. Trade-off: we lose fine-grained control over OCR confidence scores. |
+
+### What We Consciously Cut
+
+| What Was Cut | Why | Impact |
+|---|---|---|
+| **Real file upload processing** in test mode | Test cases provide structured `content` objects, not actual image files. Building a full OCR pipeline for test cases would be wasted effort. | Tests exercise extraction logic via fixture content; real uploads work via Groq Vision on the `/submit/upload` endpoint. |
+| **Persistent claim history across restarts** (in-memory mode) | Without a database, claims are stored in a Python dict. This is acceptable for demo/local use. | Production deployments use PostgreSQL. The in-memory fallback exists so the system runs with zero configuration. |
+| **Comprehensive fraud ML model** | A real fraud model needs historical data, feature engineering, and training. We implemented rule-based fraud detection (same-day count, monthly count, high-value threshold) which catches the patterns in the test cases. | Covers TC009 (same-day claims). A production system would add ML scoring based on claim history patterns. |
+| **PDF/image quality scoring** | We check for `UNREADABLE` quality flags but don't compute image quality metrics (blur detection, resolution checks). | Depends on quality metadata in the submission. Production would add OpenCV-based quality assessment. |
+| **Multi-language support** | All documents assumed to be in English. Indian medical documents often mix English with Hindi/regional languages. | Would need language detection and multilingual extraction prompts. |
+| **Claim amendment workflow** | Once a claim is decided, there's no way to amend and resubmit. | Would need a state machine (DRAFT → SUBMITTED → DECIDED → AMENDED) and version history. |
+| **WebSocket real-time updates** | Frontend polls for results after submission. | At current volume, polling is fine. WebSockets would matter for a dashboard showing live claim processing. |
+
+### Current Limitations
+
+1. **Single-threaded LLM calls**: Extraction processes documents sequentially. For claims with 5+ documents, this adds up.
+2. **No claim deduplication**: The same claim can be submitted multiple times with different claim IDs.
+3. **Static policy loading**: Policy terms are loaded at startup from JSON. No hot-reload if policy terms change mid-day.
+4. **No partial extraction recovery**: If Groq fails on document 3 of 5, we lose all extraction for that document (the pipeline continues, but with missing data).
+5. **Frontend is a single file**: The 2,078-line `page.tsx` works but violates separation of concerns. Would need component extraction for maintainability.
+6. **No rate limiting**: The API has no request throttling. A bug in the frontend could hammer the Groq API.
+
+### Scaling to 10x (750K claims/year ≈ 2,000/day)
+
+| Bottleneck | Current State | At 10x |
+|---|---|---|
+| **LLM extraction** | Sequential, ~1-2s per doc | Parallel document extraction with asyncio.gather(); batch Groq calls; add extraction result cache (Redis) |
+| **Rule engine** | In-process, <10ms | Still fine — pure Python, no I/O. 10x doesn't stress this. |
+| **Database** | Single PostgreSQL instance | Read replicas for claim lookups; connection pooling (PgBouncer); partition claim_intakes by month |
+| **Policy retrieval** | In-memory chunk index | Move to dedicated vector DB (Qdrant/Weaviate) if policy corpus grows to thousands of variants |
+| **API throughput** | Single Uvicorn worker | Multiple Uvicorn workers behind a load balancer; horizontal scaling on Render/ECS |
+| **Fraud detection** | Rule-based (threshold checks) | ML model trained on historical claim patterns; real-time feature store (Redis) |
+| **File storage** | Base64 in memory / DB | S3/GCS for document storage; signed URLs for retrieval |
+| **Observability** | Structured JSON logs | Distributed tracing (OpenTelemetry); metrics (Prometheus); alerting on decision confidence drops |
+| **Frontend** | Single Next.js instance | CDN for static assets; split page.tsx into lazy-loaded components; add WebSocket for live updates |
+
+---
+
+## 17. KEY DESIGN DECISIONS
 
 | Decision | Choice | Reason |
 |----------|--------|--------|

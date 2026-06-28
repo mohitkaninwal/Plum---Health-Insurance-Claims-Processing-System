@@ -344,6 +344,43 @@ flowchart TD
 
 ---
 
+## Trade-offs & Conscious Cuts
+
+### What We Considered and Rejected
+
+- **LLM-based adjudication** (GPT-4 / Claude decides approve/reject) — rejected because claims decisions must be auditable and reproducible. Deterministic rules give a 1:1 mapping from input to decision with a full trace. "The model said so" is not an acceptable rejection reason.
+- **OpenAI GPT-4V** for extraction — rejected for latency (2-5s vs Groq's <500ms) and cost. Trade-off: Llama 4 Scout is less accurate on degraded handwriting, but the deterministic fallback catches failures.
+- **Dedicated vector DB** (Pinecone, Weaviate) — rejected because the policy corpus is ~20 chunks. pgvector handles this trivially. Would revisit at thousands of policy variants.
+- **Sentence-transformers by default** — disabled because PyTorch consumes 300-450 MB RAM, causing OOM on Render's 512 MB free tier. SHA256 fallback preserves lexical search. Toggle with `ENABLE_EMBEDDINGS=true` on >=1 GB instances.
+- **Microservices** — rejected because at 200 claims/day, network overhead between services would exceed compute time. Modular monolith (5 rule modules) gives clean separation without deployment complexity.
+- **Celery / Redis task queue** — rejected because synchronous FastAPI with async Groq calls keeps P95 < 3s at current volume.
+
+### What We Consciously Cut
+
+- **Authentication / RBAC** — internal ops tool; first thing to add in production.
+- **Comprehensive fraud ML model** — needs historical training data. Rule-based detection (same-day count, high-value threshold) covers the test cases.
+- **Real OCR pre-processing** (Tesseract) — modern vision LLMs handle OCR implicitly; a separate step adds latency and another failure point.
+- **Claim amendment workflow** — no amend/resubmit flow. Would need a state machine with version history.
+- **Multi-language support** — assumes English. Indian medical docs often mix languages.
+- **WebSocket real-time updates** — polling is fine at current volume.
+
+### Current Limitations & Scaling to 10x
+
+| Area | Current | At 10x (2,000 claims/day) |
+|---|---|---|
+| LLM extraction | Sequential, ~1-2s/doc | Parallel with `asyncio.gather()`; Redis extraction cache |
+| Rule engine | In-process, <10ms | Still fine — pure Python, no I/O |
+| Database | Single PostgreSQL | Read replicas; PgBouncer; partition by month |
+| API throughput | Single Uvicorn worker | Multiple workers + load balancer |
+| Fraud detection | Rule-based thresholds | ML model on historical patterns |
+| File storage | Base64 in memory/DB | S3/GCS with signed URLs |
+| Observability | Structured JSON logs | OpenTelemetry tracing; Prometheus metrics |
+| Frontend | Single 2K-line page.tsx | Split into lazy-loaded components; add WebSocket |
+
+> Full trade-off analysis with rejected alternatives table: [`docs/architecture_design.md` §16](docs/architecture_design.md)
+
+---
+
 ## Error Handling & Resilience
 
 | Layer | Trigger | Behavior |
