@@ -181,23 +181,24 @@ async def submission_from_parse_form(form: ParseDocumentForm) -> ClaimSubmission
         declared_type = declared_by_name.get(file_name) or declared_by_name.get(str(index))
         patient_name = patient_names_by_name.get(file_name) or patient_names_by_name.get(str(index))
         quality = DocumentQuality.UNREADABLE if not content else DocumentQuality.UNKNOWN
-        documents.append(
-            UploadedDocument(
-                file_id=f"UPL{index:03d}",
-                file_name=file_name,
-                declared_type=declared_type,
-                quality=quality,
-                patient_name_on_doc=patient_name,
-                content={
-                    "upload": {
-                        "content_type": upload.content_type,
-                        "size_bytes": len(content),
-                        "sha256": hashlib.sha256(content).hexdigest(),
-                        "base64": base64.b64encode(content).decode("ascii"),
-                    }
-                },
-            )
+        document = UploadedDocument(
+            file_id=f"UPL{index:03d}",
+            file_name=file_name,
+            declared_type=declared_type,
+            quality=quality,
+            patient_name_on_doc=patient_name,
+            content={
+                "upload": {
+                    "content_type": upload.content_type,
+                    "size_bytes": len(content),
+                    "sha256": hashlib.sha256(content).hexdigest(),
+                    "base64": base64.b64encode(content).decode("ascii"),
+                }
+            },
         )
+        if settings.groq_api_key and upload.content_type and upload.content_type.startswith("image/"):
+            document = _classify_with_groq_vision(document, content, upload.content_type)
+        documents.append(document)
 
     return ClaimSubmission(
         member_id=form.member_id or "UNKNOWN_MEMBER",

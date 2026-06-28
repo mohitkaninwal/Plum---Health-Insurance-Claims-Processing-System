@@ -1,7 +1,7 @@
 # Eval Report
 
-Generated: 2026-06-27 19:24 UTC  
-Eval run ID: `EVAL_F005D17FA948`  
+Generated: 2026-06-28 06:27 UTC  
+Eval run ID: `EVAL_AF513FCF10DA`  
 Cases: 12/12
 
 ## Aggregate Metrics
@@ -252,7 +252,7 @@ Cases: 12/12
 7. `PatientConsistencyAgent` [INFO] — Extracted patient identity fields are consistent or unavailable.
 8. `RuleEngine` [WARNING] (-0.21) — Claim on hold — Pre-Authorization Approval required.
 
-Your Diagnostic claim (Claim ID: CLM_E003F6BB0A1B) includes a procedure that requires
+Your Diagnostic claim (Claim ID: CLM_7D15E369FAFA) includes a procedure that requires
 prior approval from the insurer before reimbursement can be processed.
 
 Procedure detected: MRI

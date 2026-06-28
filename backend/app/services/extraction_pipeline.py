@@ -99,7 +99,7 @@ def _extraction_from_preparsed_content(submission: ClaimSubmission) -> Extractio
         classification = classify_document(doc).classification
         doc_type = classification.document_type
 
-        if doc.quality in {DocumentQuality.LOW, DocumentQuality.UNKNOWN} and doc.quality is not None:
+        if doc.quality == DocumentQuality.LOW:
             low_quality.append(doc.file_id)
 
         parsed_confidence = content.get("parsed_confidence")
@@ -119,6 +119,7 @@ def _extraction_from_preparsed_content(submission: ClaimSubmission) -> Extractio
             ExtractedDocumentData(
                 file_id=doc.file_id,
                 document_type=doc_type,
+                quality=_quality_from_confidence(confidence, parsed_missing),
                 fields=parsed_fields,
                 missing_fields=parsed_missing,
                 confidence=confidence,
@@ -159,12 +160,28 @@ def _extraction_from_preparsed_content(submission: ClaimSubmission) -> Extractio
         ),
     ]
 
+    member_action_required: MemberActionRequired | None = None
+    unreadable = [data for data in extracted if data.quality == DocumentQuality.UNREADABLE]
+    if unreadable:
+        affected_ids = [data.file_id for data in unreadable]
+        doc_by_id = {doc.file_id: doc for doc in submission.documents}
+        affected_names = [doc_by_id[fid].file_name or fid for fid in affected_ids if fid in doc_by_id]
+        member_action_required = MemberActionRequired(
+            code="UNREADABLE_DOCUMENT",
+            message=(
+                f"The following document(s) could not be read or extracted: "
+                f"{', '.join(affected_names)}. "
+                "Please re-upload clearer images or provide a higher quality PDF."
+            ),
+            affected_file_ids=affected_ids,
+        )
+
     return ExtractionPipelineResult(
         submission=submission,
         extracted_documents=extracted,
         trace=trace,
         component_failures=[],
-        member_action_required=None,
+        member_action_required=member_action_required,
         confidence_impact=confidence_impact,
     )
 
@@ -191,7 +208,7 @@ def _document_verifier_agent(state: _ExtractionState) -> _ExtractionState:
     low_quality = [
         document.file_id
         for document in submission.documents
-        if document.quality in {DocumentQuality.LOW, DocumentQuality.UNKNOWN} and document.quality is not None
+        if document.quality == DocumentQuality.LOW
     ]
     state["classifications"] = classifications
     state["trace"] = [
@@ -235,6 +252,22 @@ def _vision_extraction_agent(state: _ExtractionState) -> _ExtractionState:
     state["extracted_documents"] = extracted
     state["component_failures"] = failures
     state["confidence_impact"] = confidence_impact
+
+    unreadable = [data for data in extracted if data.quality == DocumentQuality.UNREADABLE]
+    if unreadable and not state.get("member_action_required"):
+        affected_ids = [data.file_id for data in unreadable]
+        doc_by_id = {doc.file_id: doc for doc in submission.documents}
+        affected_names = [doc_by_id[fid].file_name or fid for fid in affected_ids if fid in doc_by_id]
+        state["member_action_required"] = MemberActionRequired(
+            code="UNREADABLE_DOCUMENT",
+            message=(
+                f"The following document(s) could not be read or extracted: "
+                f"{', '.join(affected_names)}. "
+                "Please re-upload clearer images or provide a higher quality PDF."
+            ),
+            affected_file_ids=affected_ids,
+        )
+
     state["trace"] = [
         *state.get("trace", []),
         TraceEvent(
@@ -352,6 +385,7 @@ def _extract_from_fixture_content(
     return ExtractedDocumentData(
         file_id=document.file_id,
         document_type=document_type,
+        quality=_quality_from_confidence(confidence, missing_fields),
         fields=normalized_fields,
         missing_fields=missing_fields,
         confidence=confidence,
@@ -392,6 +426,7 @@ def _extract_from_uploaded_text(
                 return ExtractedDocumentData(
                     file_id=document.file_id,
                     document_type=document_type,
+                    quality=_quality_from_confidence(payload.confidence, missing_fields),
                     fields=parsed_fields,
                     missing_fields=missing_fields,
                     confidence=payload.confidence,
@@ -405,6 +440,7 @@ def _extract_from_uploaded_text(
     return ExtractedDocumentData(
         file_id=document.file_id,
         document_type=document_type,
+        quality=_quality_from_confidence(confidence, missing_fields),
         fields=parsed_fields,
         missing_fields=missing_fields,
         confidence=confidence,
@@ -420,7 +456,7 @@ def _extract_with_groq(
     content_type = upload.get("content_type")
 
     if not settings.groq_api_key or not content_base64 or not content_type:
-        return _empty_extraction(document, document_type), ComponentFailure(
+        return _empty_extraction(document, document_type, has_upload_content=bool(content_base64)), ComponentFailure(
             component="VisionExtractionAgent",
             message=(
                 f"No OCR payload is available for {document.file_id}; continued with claim-level "
@@ -433,13 +469,14 @@ def _extract_with_groq(
         return ExtractedDocumentData(
             file_id=document.file_id,
             document_type=document_type,
+            quality=_quality_from_confidence(payload.confidence, payload.missing_fields),
             fields=payload.fields,
             missing_fields=payload.missing_fields,
             confidence=payload.confidence,
             warnings=payload.warnings,
         ), None
     except Exception as exc:
-        return _empty_extraction(document, document_type), ComponentFailure(
+        return _empty_extraction(document, document_type, has_upload_content=True), ComponentFailure(
             component="VisionExtractionAgent",
             message=f"Groq extraction failed for {document.file_id}: {exc}",
         )
@@ -587,19 +624,36 @@ def _json_object_candidates(raw: str) -> list[dict[str, Any]]:
     return unique
 
 
-def _empty_extraction(document: UploadedDocument, document_type: DocumentType) -> ExtractedDocumentData:
+def _empty_extraction(
+    document: UploadedDocument,
+    document_type: DocumentType,
+    has_upload_content: bool = False,
+) -> ExtractedDocumentData:
     fields: dict[str, Any] = {}
     if document.patient_name_on_doc:
         fields["patient_name"] = document.patient_name_on_doc
     missing_fields = _missing_fields(document_type, fields)
+    confidence = 0.58 if fields else 0.5
+    # Mark as UNREADABLE only when actual binary content was uploaded but could not be extracted.
+    # When there was no upload content at all (e.g. fixture documents), stay LOW.
+    quality = DocumentQuality.UNREADABLE if has_upload_content and not fields else DocumentQuality.LOW
     return ExtractedDocumentData(
         file_id=document.file_id,
         document_type=document_type,
+        quality=quality,
         fields=fields,
         missing_fields=missing_fields,
-        confidence=0.58 if fields else 0.5,
+        confidence=confidence,
         warnings=["LLM/OCR extraction unavailable; preserved available local fields."],
     )
+
+
+def _quality_from_confidence(confidence: float, missing_fields: list[str]) -> DocumentQuality:
+    if confidence >= 0.8 and not missing_fields:
+        return DocumentQuality.GOOD
+    if confidence >= 0.5:
+        return DocumentQuality.LOW
+    return DocumentQuality.UNREADABLE
 
 
 def _uploaded_text(content: bytes, content_type: str, file_name: str) -> str | None:

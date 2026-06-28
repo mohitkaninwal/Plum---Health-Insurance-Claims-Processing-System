@@ -157,6 +157,7 @@ type DocumentParseResponse = {
   extracted_documents: Array<{
     file_id: string;
     document_type: DocumentType;
+    quality: "GOOD" | "LOW" | "UNREADABLE" | "UNKNOWN";
     fields: Record<string, unknown>;
     missing_fields: string[];
     confidence: number;
@@ -397,6 +398,7 @@ export default function Home() {
       return {
         ...document,
         declaredType: parsed.document_type === "UNKNOWN" ? document.declaredType : parsed.document_type,
+        quality: parsed.quality ?? document.quality,
         patientName: document.patientName || parsedPatientName,
         parsedDocumentType: parsed.document_type,
         parsedFields: parsed.fields,

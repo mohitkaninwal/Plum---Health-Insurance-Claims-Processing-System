@@ -106,6 +106,7 @@ class DocumentClassification(BaseModel):
 class ExtractedDocumentData(BaseModel):
     file_id: str
     document_type: DocumentType
+    quality: DocumentQuality = DocumentQuality.UNKNOWN
     fields: dict[str, Any] = Field(default_factory=dict)
     missing_fields: list[str] = Field(default_factory=list)
     confidence: float = Field(ge=0, le=1)
