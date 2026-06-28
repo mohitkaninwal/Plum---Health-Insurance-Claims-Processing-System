@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import re
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -30,15 +30,43 @@ from app.models import (
     TraceLevel,
 )
 from app.models.policy import PolicyMember, PolicyTerms
-from app.services.document_intake import classify_document
 from app.services.extraction_pipeline import run_extraction_pipeline
 from app.services.policy_loader import read_policy_terms
 from app.services.policy_retriever import retrieve_policy_evidence
 
+# ── Rule module imports (aliased to preserve internal call sites) ─────────────
+from app.services.rules.gate_rules import (
+    find_member as _member_for,
+    member_name as _member_name,
+    member_dependents as _member_dependents,
+    policy_validity_reason as _policy_validity_reason,
+    submission_rules_reason as _submission_rules_reason,
+    category_coverage_reason as _category_coverage_reason,
+    patient_name_matches_member_family_reason as _patient_name_matches_member_family_reason,
+)
+from app.services.rules.document_rules import validate_documents as _validate_documents
+from app.services.rules.coverage_rules import (
+    claim_text as _claim_text,
+    exclusion_reason as _exclusion_reason,
+    vision_exclusion_reason as _vision_exclusion_reason,
+    waiting_period_reason as _waiting_period_reason,
+    pre_auth_reason as _pre_auth_reason,
+    annual_limit_reason as _annual_limit_reason,
+)
+from app.services.rules.financial_rules import (
+    approve_or_partially_approve as _approve_or_partially_approve,
+    line_items as _line_items,
+)
+from app.services.rules.fraud_rules import fraud_reason as _fraud_reason
+
 TEST_CASES_PATH = Path(__file__).resolve().parents[3] / "test_cases.json"
 
 
-def process_claim(submission: ClaimSubmission, policy: PolicyTerms | None = None) -> ClaimResponse:
+def process_claim(
+    submission: ClaimSubmission,
+    policy: PolicyTerms | None = None,
+    simulate_failure: bool = False,
+) -> ClaimResponse:
     policy = policy or read_policy_terms()
     if submission.policy_id != policy.policy_id:
         trace = [
@@ -227,7 +255,8 @@ def process_claim(submission: ClaimSubmission, policy: PolicyTerms | None = None
             extracted_document_data=extraction_result.extracted_documents,
         )
 
-    if submission.simulate_component_failure:
+    # simulate_failure comes from X-Simulate-Failure header (not the submission model)
+    if simulate_failure:
         component_failures.append(
             ComponentFailure(
                 component="PolicyEvidenceRetriever",
@@ -331,8 +360,8 @@ def process_claim(submission: ClaimSubmission, policy: PolicyTerms | None = None
             claim_id=claim_id,
         )
 
-    fraud_reason = _fraud_reason(submission, policy)
-    if fraud_reason:
+    fraud_reason_msg = _fraud_reason(submission, policy)
+    if fraud_reason_msg:
         decision = ClaimDecision(
             decision=ClaimDecisionType.MANUAL_REVIEW,
             approved_amount=0,
@@ -343,17 +372,17 @@ def process_claim(submission: ClaimSubmission, policy: PolicyTerms | None = None
                 component_failures,
                 rule_certainty_impact=-0.14,
             ),
-            reason=fraud_reason,
+            reason=fraud_reason_msg,
         )
         trace.append(
             TraceEvent(
                 component="FraudSignalAgent",
                 level=TraceLevel.WARNING,
                 message="Claim routed to manual review due to fraud signals.",
-                output_summary={"signals": [fraud_reason]},
+                output_summary={"signals": [fraud_reason_msg]},
                 checks_performed=["same_day_claim_count", "high_value_manual_review_threshold"],
                 confidence_impact=-0.14,
-                warnings=[fraud_reason],
+                warnings=[fraud_reason_msg],
             )
         )
         return _completed_response(
@@ -453,8 +482,10 @@ def run_test_case_eval(policy: PolicyTerms | None = None) -> EvalRun:
     case_results: list[EvalCaseResult] = []
 
     for raw_case in raw_cases:
-        submission = ClaimSubmission.model_validate(raw_case["input"])
-        actual = process_claim(submission, policy)
+        raw_input = raw_case["input"]
+        simulate_failure = bool(raw_input.get("simulate_component_failure", False))
+        submission = ClaimSubmission.model_validate(raw_input)
+        actual = process_claim(submission, policy, simulate_failure=simulate_failure)
         expected = raw_case["expected"]
         passed, failures = _evaluate_case(expected, actual)
         case_results.append(
@@ -491,357 +522,7 @@ def run_test_case_eval(policy: PolicyTerms | None = None) -> EvalRun:
     return eval_run
 
 
-def _validate_documents(
-    submission: ClaimSubmission,
-    policy: PolicyTerms,
-    trace: list[TraceEvent],
-    evidence: list[PolicyEvidence],
-) -> ClaimResponse | None:
-    requirement = policy.document_requirements[submission.claim_category]
-    classifications = [classify_document(doc) for doc in submission.documents]
-    uploaded_types = [item.classification.document_type for item in classifications]
-    classification_summary = [
-        {
-            "file_id": item.document.file_id,
-            "file_name": item.document.file_name,
-            "document_type": item.classification.document_type,
-            "confidence": item.classification.confidence,
-            "source": item.source,
-        }
-        for item in classifications
-    ]
-    trace.append(
-        TraceEvent(
-            component="DocumentClassifier",
-            message="Documents classified for early intake validation.",
-            input_summary={
-                "required_document_types": requirement.required,
-                "uploaded_file_ids": [doc.file_id for doc in submission.documents],
-            },
-            output_summary={"classifications": classification_summary},
-            checks_performed=["document_classification", "document_quality_available"],
-            evidence_ids=[item.evidence_id for item in evidence if item.rule_category == "document_requirements"],
-        )
-    )
-
-    unreadable = [item.document for item in classifications if item.document.quality == DocumentQuality.UNREADABLE]
-    if unreadable:
-        val_claim_id = f"CLM_{uuid4().hex[:12].upper()}"
-        filename = unreadable[0].file_name or unreadable[0].file_id
-        category_label = _readable_category(submission.claim_category)
-        detail = _msg_unreadable(val_claim_id, category_label, filename)
-        short_msg = f'The uploaded document "{filename}" is unreadable. Please re-upload a clearer image or PDF.'
-        trace.append(
-            TraceEvent(
-                component="DocumentVerifierAgent",
-                level=TraceLevel.WARNING,
-                message=short_msg,
-                output_summary={"affected_file_ids": [doc.file_id for doc in unreadable]},
-                checks_performed=["readability_check"],
-                confidence_impact=-0.35,
-                warnings=[short_msg],
-            )
-        )
-        return ClaimResponse(
-            claim_id=val_claim_id,
-            status=ClaimStatus.ACTION_REQUIRED,
-            submission=submission,
-            reason=detail,
-            member_action_required=MemberActionRequired(
-                code="UNREADABLE_DOCUMENT",
-                message=detail,
-                affected_file_ids=[doc.file_id for doc in unreadable],
-            ),
-            trace=trace,
-            retrieved_policy_evidence=evidence,
-        )
-
-    unknown = [item for item in classifications if item.classification.document_type == DocumentType.UNKNOWN]
-    if unknown:
-        val_claim_id = f"CLM_{uuid4().hex[:12].upper()}"
-        category_label = _readable_category(submission.claim_category)
-        uploaded_items = [
-            (item.document.file_name or item.document.file_id, _readable_doc_type(str(item.classification.document_type)))
-            for item in unknown
-        ]
-        detail = _msg_wrong_doc_type(val_claim_id, category_label, uploaded_items, requirement.required)
-        short_msg = (
-            f"The uploaded document {_join_names(item.document.file_name or item.document.file_id for item in unknown)} "
-            f"could not be identified as a supported document type."
-        )
-        trace.append(
-            TraceEvent(
-                component="DocumentVerifierAgent",
-                level=TraceLevel.WARNING,
-                message=short_msg,
-                output_summary={"affected_file_ids": [item.document.file_id for item in unknown]},
-                checks_performed=["supported_document_type_check"],
-                confidence_impact=-0.25,
-                warnings=[short_msg],
-            )
-        )
-        return ClaimResponse(
-            claim_id=val_claim_id,
-            status=ClaimStatus.ACTION_REQUIRED,
-            submission=submission,
-            reason=detail,
-            member_action_required=MemberActionRequired(
-                code="WRONG_DOCUMENT_TYPE",
-                message=detail,
-                affected_file_ids=[item.document.file_id for item in unknown],
-                required_document_types=requirement.required,
-            ),
-            trace=trace,
-            retrieved_policy_evidence=evidence,
-        )
-
-    missing = [doc_type for doc_type in requirement.required if doc_type not in uploaded_types]
-    if missing:
-        val_claim_id = f"CLM_{uuid4().hex[:12].upper()}"
-        category_label = _readable_category(submission.claim_category)
-        member_name = _member_name(submission, policy)
-        if len(missing) == 1:
-            detail = _detailed_missing_doc_message(missing[0], submission.claim_category, val_claim_id, member_name)
-            short_msg = (
-                f"A {_readable_doc_type(str(missing[0]))} is required for {category_label} claims "
-                f"but was not found among your uploads."
-            )
-        else:
-            detail = _msg_multiple_missing(missing, val_claim_id, submission.claim_category)
-            short_msg = (
-                f"{_join_doc_types(missing)} are required for {category_label} claims "
-                f"but were not found among your uploads."
-            )
-        trace.append(
-            TraceEvent(
-                component="DocumentVerifierAgent",
-                level=TraceLevel.WARNING,
-                message=short_msg,
-                output_summary={"missing_document_types": missing, "uploaded_document_types": uploaded_types},
-                checks_performed=["required_document_check"],
-                evidence_ids=[item.evidence_id for item in evidence if item.rule_category == "document_requirements"],
-                confidence_impact=-0.2,
-                warnings=[short_msg],
-            )
-        )
-        return ClaimResponse(
-            claim_id=val_claim_id,
-            status=ClaimStatus.ACTION_REQUIRED,
-            submission=submission,
-            reason=detail,
-            member_action_required=MemberActionRequired(
-                code="MISSING_REQUIRED_DOCUMENT",
-                message=detail,
-                required_document_types=missing,
-            ),
-            trace=trace,
-            retrieved_policy_evidence=evidence,
-        )
-
-    patient_names_by_key: dict[str, list[str]] = {}
-    patient_display_names: dict[str, str] = {}
-    for doc in submission.documents:
-        raw_name = doc.patient_name_on_doc or (doc.content or {}).get("patient_name")
-        if not raw_name:
-            continue
-        name = str(raw_name).strip()
-        key = re.sub(r"\s+", " ", name).casefold()
-        patient_names_by_key.setdefault(key, []).append(doc.file_id)
-        patient_display_names.setdefault(key, name)
-
-    if len(patient_names_by_key) > 1:
-        val_claim_id = f"CLM_{uuid4().hex[:12].upper()}"
-        names = [patient_display_names[key] for key in sorted(patient_names_by_key)]
-        affected_file_ids = [
-            file_id for key in sorted(patient_names_by_key) for file_id in patient_names_by_key[key]
-        ]
-        category_label = _readable_category(submission.claim_category)
-        policy_member_name = _member_name(submission, policy)
-        dependents = _member_dependents(submission, policy)
-        detail = _msg_patient_mismatch(val_claim_id, category_label, names, policy_member_name, submission.member_id, dependents)
-        short_msg = (
-            "Uploaded documents appear to belong to different patients: "
-            f"{', '.join(names)}. Please upload documents for the same patient."
-        )
-        trace.append(
-            TraceEvent(
-                component="PatientConsistencyAgent",
-                level=TraceLevel.WARNING,
-                message=short_msg,
-                output_summary={"patient_names": names, "affected_file_ids": affected_file_ids},
-                checks_performed=["patient_consistency_check"],
-                confidence_impact=-0.25,
-                warnings=[short_msg],
-            )
-        )
-        return ClaimResponse(
-            claim_id=val_claim_id,
-            status=ClaimStatus.ACTION_REQUIRED,
-            submission=submission,
-            reason=detail,
-            member_action_required=MemberActionRequired(
-                code="PATIENT_MISMATCH",
-                message=detail,
-                affected_file_ids=affected_file_ids,
-            ),
-            trace=trace,
-            retrieved_policy_evidence=evidence,
-        )
-
-    trace.append(
-        TraceEvent(
-            component="DocumentVerifierAgent",
-            message="Required documents are present, readable, and patient names are consistent.",
-            input_summary={"required_document_types": requirement.required},
-            output_summary={"document_types": uploaded_types},
-            checks_performed=[
-                "required_document_check",
-                "readability_check",
-                "supported_document_type_check",
-                "patient_consistency_check",
-            ],
-            evidence_ids=[item.evidence_id for item in evidence if item.rule_category == "document_requirements"],
-        )
-    )
-    return None
-
-
-def _patient_name_matches_member_family_reason(
-    submission: ClaimSubmission,
-    member: PolicyMember | None,
-    policy: PolicyTerms,
-    extracted_documents: list[ExtractedDocumentData],
-) -> str | None:
-    observed_names = _observed_patient_names(submission, extracted_documents)
-    if not observed_names or member is None:
-        return None
-
-    allowed_names = _allowed_patient_names(member, policy)
-    if not allowed_names:
-        return None
-
-    unrecognized = [name for name in observed_names if _name_key(name) not in allowed_names]
-    if not unrecognized:
-        return None
-
-    allowed_display = sorted({_normalize_name(name) for name in allowed_names.values()})
-    return (
-        "Uploaded documents mention patient "
-        f"{', '.join(unrecognized)}, but the selected member {submission.member_id} only covers "
-        f"{', '.join(allowed_display)}."
-    )
-
-
-def _allowed_patient_names(member: PolicyMember, policy: PolicyTerms) -> dict[str, str]:
-    allowed: dict[str, str] = {_name_key(member.name): member.name}
-    members_by_id = {item.member_id: item for item in policy.members}
-
-    for dependent_id in member.dependents:
-        dependent = members_by_id.get(dependent_id)
-        if dependent is not None:
-            allowed[_name_key(dependent.name)] = dependent.name
-
-    for item in policy.members:
-        if item.primary_member_id == member.member_id:
-            allowed[_name_key(item.name)] = item.name
-
-    return allowed
-
-
-def _observed_patient_names(
-    submission: ClaimSubmission,
-    extracted_documents: list[ExtractedDocumentData],
-) -> list[str]:
-    names: list[str] = []
-    for document in submission.documents:
-        if document.patient_name_on_doc:
-            names.append(document.patient_name_on_doc)
-
-    for item in extracted_documents:
-        raw_name = item.fields.get("patient_name")
-        if isinstance(raw_name, str) and raw_name.strip():
-            names.append(raw_name.strip())
-    return _dedupe_names(names)
-
-
-def _approve_or_partially_approve(
-    submission: ClaimSubmission, policy: PolicyTerms, confidence: float
-) -> ClaimDecision:
-    category_config = policy.opd_categories[submission.claim_category.lower()]
-    line_items = _line_items(submission)
-
-    if submission.claim_category == "DENTAL":
-        excluded = {item.lower() for item in (category_config.excluded_procedures or [])}
-        decisions: list[LineItemDecision] = []
-        approved_amount = 0.0
-        for item in line_items:
-            description = str(item.get("description", "Line item"))
-            amount = float(item.get("amount", 0))
-            is_excluded = any(term in description.lower() for term in excluded)
-            if is_excluded:
-                decisions.append(
-                    LineItemDecision(
-                        description=description,
-                        claimed_amount=amount,
-                        approved_amount=0,
-                        decision=LineItemDecisionType.REJECTED,
-                        reason="Excluded cosmetic dental procedure.",
-                    )
-                )
-            else:
-                approved_amount += amount
-                decisions.append(
-                    LineItemDecision(
-                        description=description,
-                        claimed_amount=amount,
-                        approved_amount=amount,
-                        decision=LineItemDecisionType.APPROVED,
-                        reason="Covered dental procedure.",
-                    )
-                )
-        decision_type = ClaimDecisionType.PARTIAL if approved_amount < submission.claimed_amount else ClaimDecisionType.APPROVED
-        rejection_reasons = ["EXCLUDED_DENTAL_PROCEDURE"] if approved_amount == 0 else []
-        if approved_amount == 0:
-            decision_type = ClaimDecisionType.REJECTED
-        return ClaimDecision(
-            decision=decision_type,
-            approved_amount=approved_amount,
-            confidence_score=confidence,
-            reason="Covered dental items were approved and excluded cosmetic items were rejected.",
-            rejection_reasons=rejection_reasons,
-            line_item_decisions=decisions,
-        )
-
-    base_amount = submission.claimed_amount
-    hospital = submission.hospital_name or _hospital_name(submission)
-    parts: list[str] = []
-    if hospital in policy.network_hospitals and category_config.network_discount_percent:
-        discount = base_amount * category_config.network_discount_percent / 100
-        base_amount -= discount
-        parts.append(
-            f"Network discount {category_config.network_discount_percent:.0f}% applied before co-pay."
-        )
-    if category_config.copay_percent:
-        copay = base_amount * category_config.copay_percent / 100
-        base_amount -= copay
-        parts.append(f"Co-pay {category_config.copay_percent:.0f}% deducted.")
-
-    reason = " ".join(parts) or "Claim satisfies deterministic policy checks."
-    return ClaimDecision(
-        decision=ClaimDecisionType.APPROVED,
-        approved_amount=round(base_amount, 2),
-        confidence_score=confidence,
-        reason=reason,
-        line_item_decisions=[
-            LineItemDecision(
-                description="Claim total",
-                claimed_amount=submission.claimed_amount,
-                approved_amount=round(base_amount, 2),
-                decision=LineItemDecisionType.APPROVED,
-                reason=reason,
-            )
-        ],
-    )
+# ── Response builders ─────────────────────────────────────────────────────────
 
 
 def _rejected(
@@ -922,6 +603,114 @@ def _completed_response(
     )
 
 
+def _action_required_response(
+    submission: ClaimSubmission,
+    trace: list[TraceEvent],
+    evidence: list[PolicyEvidence],
+    reason: str,
+    *,
+    code: str,
+    claim_id: str | None = None,
+    component_failures: list[ComponentFailure] | None = None,
+    extracted_document_data: list[ExtractedDocumentData] | None = None,
+    required_document_types: list[DocumentType] | None = None,
+) -> ClaimResponse:
+    affected_file_ids = [item.file_id for item in extracted_document_data or []] or [
+        document.file_id for document in submission.documents
+    ]
+    extra: dict[str, Any] = {"claim_id": claim_id} if claim_id is not None else {}
+    return ClaimResponse(
+        **extra,
+        status=ClaimStatus.ACTION_REQUIRED,
+        submission=submission,
+        reason=reason,
+        member_action_required=MemberActionRequired(
+            code=code,
+            message=reason,
+            affected_file_ids=affected_file_ids,
+            required_document_types=required_document_types or [],
+        ),
+        trace=trace,
+        retrieved_policy_evidence=evidence,
+        component_failures=component_failures or [],
+        extracted_document_data=extracted_document_data or [],
+    )
+
+
+# ── Confidence scoring ────────────────────────────────────────────────────────
+
+
+def _confidence_score(
+    submission: ClaimSubmission,
+    evidence: list[PolicyEvidence],
+    extracted_documents: list[ExtractedDocumentData],
+    component_failures: list[ComponentFailure] | None = None,
+    *,
+    rule_certainty_impact: float = 0,
+) -> float:
+    inputs = _confidence_inputs(submission, evidence, extracted_documents, component_failures or [])
+    score = 0.97
+    score += inputs["document_quality_impact"]
+    score += inputs["extraction_completeness_impact"]
+    score += inputs["policy_evidence_impact"]
+    score += rule_certainty_impact
+    score += inputs["component_failure_impact"]
+    return round(max(0.5, min(0.99, score)), 2)
+
+
+def _confidence_inputs(
+    submission: ClaimSubmission,
+    evidence: list[PolicyEvidence],
+    extracted_documents: list[ExtractedDocumentData],
+    component_failures: list[ComponentFailure],
+) -> dict[str, Any]:
+    qualities = [document.quality for document in submission.documents]
+    low_quality_count = sum(1 for quality in qualities if quality == DocumentQuality.LOW)
+    unknown_quality_count = sum(1 for quality in qualities if quality == DocumentQuality.UNKNOWN)
+    unreadable_count = sum(1 for quality in qualities if quality == DocumentQuality.UNREADABLE)
+    missing_field_count = sum(len(item.missing_fields) for item in extracted_documents)
+    average_extraction_confidence = (
+        sum(item.confidence for item in extracted_documents) / len(extracted_documents)
+        if extracted_documents
+        else 0
+    )
+    evidence_strength = (
+        max((item.rrf_score or item.dense_score or item.lexical_score or 0) for item in evidence)
+        if evidence
+        else 0
+    )
+
+    document_quality_impact = (
+        -0.35 * unreadable_count
+        - 0.05 * low_quality_count
+        - 0.02 * unknown_quality_count
+    )
+    extraction_completeness_impact = 0.0
+    if extracted_documents:
+        extraction_completeness_impact -= min(0.14, 0.025 * missing_field_count)
+        extraction_completeness_impact -= max(0.0, 0.9 - average_extraction_confidence) * 0.2
+    policy_evidence_impact = 0.0 if evidence_strength >= 0.02 else -0.04
+    component_failure_impact = -0.08 * len(component_failures)
+
+    return {
+        "document_quality": [str(quality) for quality in qualities],
+        "document_quality_impact": round(document_quality_impact, 4),
+        "extracted_document_count": len(extracted_documents),
+        "missing_field_count": missing_field_count,
+        "average_extraction_confidence": round(average_extraction_confidence, 4),
+        "extraction_completeness_impact": round(extraction_completeness_impact, 4),
+        "patient_consistency": "passed",
+        "policy_evidence_count": len(evidence),
+        "strongest_policy_evidence_score": round(evidence_strength, 6),
+        "policy_evidence_impact": round(policy_evidence_impact, 4),
+        "component_failure_count": len(component_failures),
+        "component_failure_impact": round(component_failure_impact, 4),
+    }
+
+
+# ── Trace / explainability helpers ────────────────────────────────────────────
+
+
 def _final_explainability_trace(
     submission: ClaimSubmission,
     decision: ClaimDecision,
@@ -988,75 +777,6 @@ def _final_explainability_trace(
             warnings=[failure.message for failure in component_failures],
         ),
     ]
-
-
-def _confidence_score(
-    submission: ClaimSubmission,
-    evidence: list[PolicyEvidence],
-    extracted_documents: list[ExtractedDocumentData],
-    component_failures: list[ComponentFailure] | None = None,
-    *,
-    rule_certainty_impact: float = 0,
-) -> float:
-    inputs = _confidence_inputs(submission, evidence, extracted_documents, component_failures or [])
-    score = 0.97
-    score += inputs["document_quality_impact"]
-    score += inputs["extraction_completeness_impact"]
-    score += inputs["policy_evidence_impact"]
-    score += rule_certainty_impact
-    score += inputs["component_failure_impact"]
-    return round(max(0.5, min(0.99, score)), 2)
-
-
-def _confidence_inputs(
-    submission: ClaimSubmission,
-    evidence: list[PolicyEvidence],
-    extracted_documents: list[ExtractedDocumentData],
-    component_failures: list[ComponentFailure],
-) -> dict[str, Any]:
-    qualities = [document.quality for document in submission.documents]
-    low_quality_count = sum(1 for quality in qualities if quality == DocumentQuality.LOW)
-    unknown_quality_count = sum(1 for quality in qualities if quality == DocumentQuality.UNKNOWN)
-    unreadable_count = sum(1 for quality in qualities if quality == DocumentQuality.UNREADABLE)
-    # None means quality was not assessed (fixtures, pre-parsed uploads) — no penalty applied
-    missing_field_count = sum(len(item.missing_fields) for item in extracted_documents)
-    average_extraction_confidence = (
-        sum(item.confidence for item in extracted_documents) / len(extracted_documents)
-        if extracted_documents
-        else 0
-    )
-    evidence_strength = (
-        max((item.rrf_score or item.dense_score or item.lexical_score or 0) for item in evidence)
-        if evidence
-        else 0
-    )
-
-    document_quality_impact = (
-        -0.35 * unreadable_count
-        - 0.05 * low_quality_count
-        - 0.02 * unknown_quality_count
-    )
-    extraction_completeness_impact = 0.0
-    if extracted_documents:
-        extraction_completeness_impact -= min(0.14, 0.025 * missing_field_count)
-        extraction_completeness_impact -= max(0.0, 0.9 - average_extraction_confidence) * 0.2
-    policy_evidence_impact = 0.0 if evidence_strength >= 0.02 else -0.04
-    component_failure_impact = -0.08 * len(component_failures)
-
-    return {
-        "document_quality": [str(quality) for quality in qualities],
-        "document_quality_impact": round(document_quality_impact, 4),
-        "extracted_document_count": len(extracted_documents),
-        "missing_field_count": missing_field_count,
-        "average_extraction_confidence": round(average_extraction_confidence, 4),
-        "extraction_completeness_impact": round(extraction_completeness_impact, 4),
-        "patient_consistency": "passed",
-        "policy_evidence_count": len(evidence),
-        "strongest_policy_evidence_score": round(evidence_strength, 6),
-        "policy_evidence_impact": round(policy_evidence_impact, 4),
-        "component_failure_count": len(component_failures),
-        "component_failure_impact": round(component_failure_impact, 4),
-    }
 
 
 def _document_check_summary(submission: ClaimSubmission) -> list[dict[str, Any]]:
@@ -1136,290 +856,7 @@ def _rule_checks_for_rejection(rejection_reasons: list[str]) -> list[str]:
     return checks
 
 
-def _member_for(member_id: str, policy: PolicyTerms) -> PolicyMember | None:
-    return next((member for member in policy.members if member.member_id == member_id), None)
-
-
-def _action_required_response(
-    submission: ClaimSubmission,
-    trace: list[TraceEvent],
-    evidence: list[PolicyEvidence],
-    reason: str,
-    *,
-    code: str,
-    claim_id: str | None = None,
-    component_failures: list[ComponentFailure] | None = None,
-    extracted_document_data: list[ExtractedDocumentData] | None = None,
-    required_document_types: list[DocumentType] | None = None,
-) -> ClaimResponse:
-    affected_file_ids = [item.file_id for item in extracted_document_data or []] or [
-        document.file_id for document in submission.documents
-    ]
-    extra: dict[str, Any] = {"claim_id": claim_id} if claim_id is not None else {}
-    return ClaimResponse(
-        **extra,
-        status=ClaimStatus.ACTION_REQUIRED,
-        submission=submission,
-        reason=reason,
-        member_action_required=MemberActionRequired(
-            code=code,
-            message=reason,
-            affected_file_ids=affected_file_ids,
-            required_document_types=required_document_types or [],
-        ),
-        trace=trace,
-        retrieved_policy_evidence=evidence,
-        component_failures=component_failures or [],
-        extracted_document_data=extracted_document_data or [],
-    )
-
-
-def _patient_name_matches_member_family_reason(
-    submission: ClaimSubmission,
-    member: PolicyMember | None,
-    policy: PolicyTerms,
-    extracted_documents: list[ExtractedDocumentData],
-    claim_id: str,
-) -> str | None:
-    observed_names = _observed_patient_names(submission, extracted_documents)
-    if not observed_names or member is None:
-        return None
-
-    allowed_names = _allowed_patient_names(member, policy)
-    if not allowed_names:
-        return None
-
-    unrecognized = [name for name in observed_names if _name_key(name) not in allowed_names]
-    if not unrecognized:
-        return None
-
-    category_label = _readable_category(submission.claim_category)
-    dependents = _member_dependents(submission, policy)
-    return _msg_patient_mismatch(
-        claim_id,
-        category_label,
-        unrecognized,
-        member.name,
-        submission.member_id,
-        dependents,
-    )
-
-
-def _allowed_patient_names(member: PolicyMember, policy: PolicyTerms) -> dict[str, str]:
-    allowed: dict[str, str] = {_name_key(member.name): member.name}
-    members_by_id = {item.member_id: item for item in policy.members}
-
-    for dependent_id in member.dependents:
-        dependent = members_by_id.get(dependent_id)
-        if dependent is not None:
-            allowed[_name_key(dependent.name)] = dependent.name
-
-    for item in policy.members:
-        if item.primary_member_id == member.member_id:
-            allowed[_name_key(item.name)] = item.name
-
-    return allowed
-
-
-def _observed_patient_names(
-    submission: ClaimSubmission,
-    extracted_documents: list[ExtractedDocumentData],
-) -> list[str]:
-    names: list[str] = []
-    for document in submission.documents:
-        if document.patient_name_on_doc:
-            names.append(document.patient_name_on_doc)
-
-    for item in extracted_documents:
-        raw_name = item.fields.get("patient_name")
-        if isinstance(raw_name, str) and raw_name.strip():
-            names.append(raw_name.strip())
-    return _dedupe_preserve_order(names)
-
-
-def _policy_validity_reason(submission: ClaimSubmission, policy: PolicyTerms) -> str | None:
-    holder = policy.policy_holder
-    if holder.renewal_status.upper() != "ACTIVE":
-        return f"Policy {policy.policy_id} is not active; renewal status is {holder.renewal_status}."
-    if submission.treatment_date < holder.policy_start_date:
-        return (
-            f"Treatment date {submission.treatment_date.isoformat()} is before policy start date "
-            f"{holder.policy_start_date.isoformat()}."
-        )
-    if submission.treatment_date > holder.policy_end_date:
-        return (
-            f"Treatment date {submission.treatment_date.isoformat()} is after policy end date "
-            f"{holder.policy_end_date.isoformat()}."
-        )
-    return None
-
-
-def _submission_rules_reason(submission: ClaimSubmission, policy: PolicyTerms, claim_id: str) -> str | None:
-    if submission.claimed_amount < policy.submission_rules.minimum_claim_amount:
-        return (
-            f"Claimed amount {policy.submission_rules.currency} {submission.claimed_amount:.0f} is below "
-            f"the minimum claim amount of {policy.submission_rules.currency} "
-            f"{policy.submission_rules.minimum_claim_amount:.0f}."
-        )
-
-    submitted_on = _submitted_on(submission)
-    days_after_treatment = (submitted_on - submission.treatment_date).days
-    deadline_days = policy.submission_rules.deadline_days_from_treatment
-    if days_after_treatment > deadline_days:
-        category_label = _readable_category(submission.claim_category)
-        days_overdue = days_after_treatment - deadline_days
-        return _msg_deadline_exceeded(
-            claim_id,
-            category_label,
-            submission.treatment_date,
-            submitted_on,
-            deadline_days,
-            days_overdue,
-        )
-    return None
-
-
-def _submitted_on(submission: ClaimSubmission) -> date:
-    for doc in submission.documents:
-        content = doc.content or {}
-        raw_date = content.get("submitted_on") or content.get("submission_date")
-        if isinstance(raw_date, date):
-            return raw_date
-        if isinstance(raw_date, str):
-            try:
-                return date.fromisoformat(raw_date)
-            except ValueError:
-                continue
-    return submission.treatment_date
-
-
-def _category_coverage_reason(submission: ClaimSubmission, policy: PolicyTerms) -> str | None:
-    config = policy.opd_categories[submission.claim_category.lower()]
-    if not config.covered:
-        return f"{submission.claim_category} claims are not covered under policy {policy.policy_id}."
-    return None
-
-
-def _annual_limit_reason(submission: ClaimSubmission, policy: PolicyTerms) -> str | None:
-    ytd_claims = submission.ytd_claims_amount or 0
-    projected_total = ytd_claims + submission.claimed_amount
-    if projected_total > policy.coverage.annual_opd_limit:
-        return (
-            f"Projected annual OPD claims would be INR {projected_total:.0f}, exceeding the annual "
-            f"OPD limit of INR {policy.coverage.annual_opd_limit:.0f}."
-        )
-    return None
-
-
-def _claim_text(submission: ClaimSubmission) -> str:
-    return json.dumps([doc.content or {} for doc in submission.documents], sort_keys=True).lower()
-
-
-def _exclusion_reason(text: str, policy: PolicyTerms) -> str | None:
-    for term in policy.exclusions.conditions:
-        normalized = term.lower()
-        if "obesity" in normalized and ("obesity" in text or "bariatric" in text or "diet" in text):
-            return f"Treatment is excluded under policy exclusion: {term}."
-        if normalized in text:
-            return f"Treatment is excluded under policy exclusion: {term}."
-    return None
-
-
-def _vision_exclusion_reason(submission: ClaimSubmission, text: str, policy: PolicyTerms) -> str | None:
-    if submission.claim_category != "VISION":
-        return None
-    for term in policy.exclusions.vision_exclusions:
-        if term.lower() in text:
-            return f"Vision item is excluded under policy exclusion: {term}."
-    config = policy.opd_categories["vision"]
-    for item in config.excluded_items or []:
-        if item.lower() in text:
-            return f"Vision item is excluded under category rule: {item}."
-    return None
-
-
-def _waiting_period_reason(
-    submission: ClaimSubmission, member: PolicyMember, text: str, policy: PolicyTerms
-) -> str | None:
-    if member.join_date is None:
-        return None
-    for condition, days in policy.waiting_periods.specific_conditions.items():
-        condition_text = condition.replace("_", " ")
-        aliases = {condition_text}
-        if condition == "diabetes":
-            aliases.add("diabetes mellitus")
-        if any(re.search(rf"\b{re.escape(alias)}\b", text) for alias in aliases):
-            eligible_from = member.join_date.toordinal() + days
-            eligible_date = date.fromordinal(eligible_from)
-            if submission.treatment_date < eligible_date:
-                return (
-                    f"{condition_text.title()} treatment is in the {days}-day waiting period. "
-                    f"Member is eligible for this condition from {eligible_date.isoformat()}."
-                )
-    return None
-
-
-def _pre_auth_reason(submission: ClaimSubmission, policy: PolicyTerms, claim_id: str) -> str | None:
-    config = policy.opd_categories[submission.claim_category.lower()]
-    high_value_tests = config.high_value_tests_requiring_pre_auth or []
-    if not high_value_tests or config.pre_auth_threshold is None:
-        return None
-    for test in high_value_tests:
-        test_text = test.lower()
-        for item in _line_items(submission):
-            description = str(item.get("description", item.get("test_name", ""))).lower()
-            amount = float(item.get("amount", submission.claimed_amount))
-            if test_text in description and amount > config.pre_auth_threshold:
-                return _msg_pre_auth_missing(claim_id, test, amount, config.pre_auth_threshold)
-    return None
-
-
-def _fraud_reason(submission: ClaimSubmission, policy: PolicyTerms) -> str | None:
-    same_day_count = sum(
-        1 for claim in submission.claims_history if claim.date == submission.treatment_date
-    )
-    if same_day_count >= policy.fraud_thresholds.same_day_claims_limit:
-        return (
-            f"{same_day_count + 1} same-day claims for member {submission.member_id}; "
-            "manual review required before payment."
-        )
-    if submission.claimed_amount > policy.fraud_thresholds.auto_manual_review_above:
-        return "High-value claim exceeds automatic approval threshold; manual review required."
-    return None
-
-
-def _line_items(submission: ClaimSubmission) -> list[dict[str, Any]]:
-    items: list[dict[str, Any]] = []
-    for doc in submission.documents:
-        content = doc.content or {}
-        items.extend(content.get("line_items", []))
-        if "test_name" in content:
-            items.append({"description": content["test_name"], "amount": submission.claimed_amount})
-    return items or [{"description": "Claim total", "amount": submission.claimed_amount}]
-
-
-def _hospital_name(submission: ClaimSubmission) -> str | None:
-    for doc in submission.documents:
-        content = doc.content or {}
-        if "hospital_name" in content:
-            return str(content["hospital_name"])
-    return None
-
-
-def _name_key(value: str) -> str:
-    return re.sub(r"\s+", " ", value).strip().casefold()
-
-
-def _dedupe_preserve_order(values: list[str]) -> list[str]:
-    seen: set[str] = set()
-    result: list[str] = []
-    for value in values:
-        key = _name_key(value)
-        if key in seen:
-            continue
-        seen.add(key)
-        result.append(value)
-    return result
+# ── Policy evidence retrieval ─────────────────────────────────────────────────
 
 
 def _policy_evidence(submission: ClaimSubmission, policy: PolicyTerms) -> list[PolicyEvidence]:
@@ -1452,11 +889,12 @@ def _policy_evidence(submission: ClaimSubmission, policy: PolicyTerms) -> list[P
     ]
 
 
+# ── Eval helpers ──────────────────────────────────────────────────────────────
+
+
 def _evaluate_case(expected: dict[str, Any], actual: ClaimResponse) -> tuple[bool, list[str]]:
-    """Return (passed, failed_notes) where failed_notes lists every requirement that was not met."""
     failures: list[str] = []
 
-    # ── core decision checks ──────────────────────────────────────────────────
     if expected.get("decision") is None:
         if not (actual.status == ClaimStatus.ACTION_REQUIRED and actual.decision is None):
             failures.append(
@@ -1491,7 +929,6 @@ def _evaluate_case(expected: dict[str, Any], actual: ClaimResponse) -> tuple[boo
                 f"Expected confidence > 0.85 but got {actual.confidence_score}"
             )
 
-    # ── system_must checks ────────────────────────────────────────────────────
     for requirement in expected.get("system_must", []):
         failure = _check_system_must(requirement, actual)
         if failure:
@@ -1501,12 +938,10 @@ def _evaluate_case(expected: dict[str, Any], actual: ClaimResponse) -> tuple[boo
 
 
 def _check_system_must(requirement: str, actual: ClaimResponse) -> str | None:
-    """Return a failure message if the requirement is not met, else None."""
     req = requirement.lower()
     reason_text = (actual.reason or "").lower()
     mar = actual.member_action_required
 
-    # TC001 / TC002 / TC003 — early stop requirements
     if "stop before making any claim decision" in req:
         if not (actual.status == ClaimStatus.ACTION_REQUIRED and actual.decision is None):
             return f"FAIL: '{requirement}' — claim was not stopped early"
@@ -1543,7 +978,6 @@ def _check_system_must(requirement: str, actual: ClaimResponse) -> str | None:
             return f"FAIL: '{requirement}' — code is {mar.code if mar else 'absent'}, expected PATIENT_MISMATCH"
 
     if "surface this to the member with the specific names" in req:
-        # TC003 documents have patient_name_on_doc "Rajesh Kumar" and "Arjun Mehta"
         names_in_message = sum(
             1 for name in ["rajesh", "arjun", "kumar", "mehta"]
             if name in (mar.message if mar else "").lower() or name in reason_text
@@ -1555,7 +989,6 @@ def _check_system_must(requirement: str, actual: ClaimResponse) -> str | None:
         if actual.decision is not None:
             return f"FAIL: '{requirement}' — a claim decision was produced"
 
-    # TC005 — waiting period eligibility date
     if "date from which the member will be eligible" in req:
         has_date = bool(re.search(r"\d{4}-\d{2}-\d{2}", reason_text)) or \
                    any(
@@ -1565,7 +998,6 @@ def _check_system_must(requirement: str, actual: ClaimResponse) -> str | None:
         if not has_date:
             return f"FAIL: '{requirement}' — eligibility date not found in reason"
 
-    # TC006 — line-item itemization
     if "itemize which line items were approved and which were rejected" in req:
         if not actual.line_item_decisions:
             return f"FAIL: '{requirement}' — line_item_decisions is empty"
@@ -1580,7 +1012,6 @@ def _check_system_must(requirement: str, actual: ClaimResponse) -> str | None:
         if bad:
             return f"FAIL: '{requirement}' — items without reason: {bad}"
 
-    # TC007 — pre-authorization
     if "pre-authorization was required and not obtained" in req:
         has_preauth = any(
             kw in reason_text
@@ -1597,13 +1028,11 @@ def _check_system_must(requirement: str, actual: ClaimResponse) -> str | None:
         if not has_action:
             return f"FAIL: '{requirement}' — no resubmission instruction in reason"
 
-    # TC008 — per-claim limit amounts
     if "state the per-claim limit and the claimed amount clearly" in req:
         has_two_amounts = len(re.findall(r"\d[\d,]+", reason_text)) >= 2
         if not has_two_amounts:
             return f"FAIL: '{requirement}' — reason does not contain both limit and claimed amounts"
 
-    # TC009 — fraud / same-day
     if "flag the unusual same-day claim pattern" in req:
         has_sameday = any(
             kw in reason_text for kw in ["same-day", "same day", "same_day"]
@@ -1619,10 +1048,7 @@ def _check_system_must(requirement: str, actual: ClaimResponse) -> str | None:
         if len(reason_text) < 30:
             return f"FAIL: '{requirement}' — reason is too short to include specific signals"
 
-    # TC010 — network discount order
     if "apply network discount before co-pay, not after" in req:
-        # Verified by amount: 4000 * 0.90 * 0.90 = 3240 (discount first, then copay)
-        # vs 4000 * (1 - 0.10 - 0.10) = 3200 (wrong: subtract both together)
         if actual.approved_amount is not None and abs(actual.approved_amount - 3240.0) > 0.01:
             return (
                 f"FAIL: '{requirement}' — approved_amount={actual.approved_amount}, "
@@ -1637,9 +1063,7 @@ def _check_system_must(requirement: str, actual: ClaimResponse) -> str | None:
         if not has_discount:
             return f"FAIL: '{requirement}' — discount/co-pay breakdown absent from reason"
 
-    # TC011 — component failure / graceful degradation
     if "not crash or return a 500 error" in req:
-        # If we have an actual response object this check trivially passes.
         pass
 
     if "indicate in the output that a component failed and was skipped" in req:
@@ -1687,7 +1111,6 @@ def _system_must_accuracy(case_results: list[EvalCaseResult]) -> float:
 
 
 def _rejection_reason_metrics(case_results: list[EvalCaseResult]) -> tuple[float, float, float]:
-    """Macro-averaged precision, recall, F1 over rejection reason label codes."""
     cases = [c for c in case_results if c.expected.get("rejection_reasons")]
     if not cases:
         return 1.0, 1.0, 1.0
@@ -1710,9 +1133,6 @@ def _rejection_reason_metrics(case_results: list[EvalCaseResult]) -> tuple[float
 
 
 def generate_eval_report(eval_run: "EvalRun", output_path: Path | None = None) -> str:
-    """Generate a Markdown eval report and write it to docs/eval_report.md."""
-    from app.models import EvalRun as _EvalRun  # local import to avoid circular at module level
-
     out_path = output_path or (DOCS_DIR / "eval_report.md")
     m = eval_run.metrics
     lines: list[str] = []
@@ -1817,324 +1237,9 @@ def generate_eval_report(eval_run: "EvalRun", output_path: Path | None = None) -
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_text(report, encoding="utf-8")
     except OSError:
-        pass  # non-fatal: report is still returned as a string
+        pass
     return report
 
 
 def _pct(value: float | None) -> str:
     return f"{value * 100:.1f}%" if value is not None else "—"
-
-
-_DOC_TYPE_LABELS: dict[str, str] = {
-    "PRESCRIPTION": "Prescription",
-    "HOSPITAL_BILL": "Hospital Bill",
-    "LAB_REPORT": "Lab Report",
-    "DIAGNOSTIC_REPORT": "Diagnostic Report",
-    "PHARMACY_BILL": "Pharmacy Bill",
-    "DISCHARGE_SUMMARY": "Discharge Summary",
-    "DENTAL_REPORT": "Dental Report",
-    "UNKNOWN": "Unknown Document",
-}
-
-_CATEGORY_LABELS: dict[str, str] = {
-    "CONSULTATION": "Consultation",
-    "DIAGNOSTIC": "Diagnostic",
-    "PHARMACY": "Pharmacy",
-    "DENTAL": "Dental",
-    "VISION": "Vision",
-    "ALTERNATIVE_MEDICINE": "Alternative Medicine",
-}
-
-
-def _readable_doc_type(doc_type: str) -> str:
-    return _DOC_TYPE_LABELS.get(str(doc_type).upper(), str(doc_type).replace("_", " ").title())
-
-
-def _readable_category(category: Any) -> str:
-    return _CATEGORY_LABELS.get(str(category).upper(), str(category).replace("_", " ").title())
-
-
-def _join_doc_types(types: Any) -> str:
-    labels = [_readable_doc_type(str(t)) for t in types]
-    if len(labels) == 0:
-        return ""
-    if len(labels) == 1:
-        return labels[0]
-    return ", ".join(labels[:-1]) + " and " + labels[-1]
-
-
-def _join_names(names: Any) -> str:
-    items = list(names)
-    if len(items) == 0:
-        return ""
-    if len(items) == 1:
-        return f'"{items[0]}"'
-    return ", ".join(f'"{n}"' for n in items[:-1]) + f' and "{items[-1]}"'
-
-
-# ── Member lookup helpers ──────────────────────────────────────────────────────
-
-
-def _member_name(submission: ClaimSubmission, policy: PolicyTerms) -> str:
-    for m in policy.members:
-        if m.member_id == submission.member_id:
-            return m.name
-    return submission.member_id
-
-
-def _member_dependents(submission: ClaimSubmission, policy: PolicyTerms) -> list[str]:
-    member = _member_for(submission.member_id, policy)
-    if member is None:
-        return []
-    members_by_id = {m.member_id: m for m in policy.members}
-    result: list[str] = []
-    for dep_id in member.dependents:
-        dep = members_by_id.get(dep_id)
-        if dep is not None:
-            result.append(dep.name)
-    for m in policy.members:
-        if m.primary_member_id == member.member_id:
-            result.append(m.name)
-    return result
-
-
-# ── Detailed message builders ──────────────────────────────────────────────────
-
-
-def _msg_missing_prescription(claim_id: str, claim_category: str, member_name: str) -> str:
-    return (
-        f"Claim cannot proceed — Doctor's Prescription missing.\n\n"
-        f"Your {claim_category} claim (Claim ID: {claim_id}) requires a valid doctor's prescription\n"
-        f"but none was found in your submission.\n\n"
-        f"What qualifies as a valid prescription:\n"
-        f"  \u2713 Issued by an MBBS or higher qualified doctor\n"
-        f"  \u2713 Contains doctor's MCI/state registration number (e.g. KA/45678/2015)\n"
-        f"  \u2713 Shows patient name matching your policy ({member_name})\n"
-        f"  \u2713 Dated within 30 days of treatment\n"
-        f"  \u2713 Includes diagnosis and treatment advised\n\n"
-        f"What does NOT qualify:\n"
-        f"  \u2717 Pharmacy receipts or bills\n"
-        f"  \u2717 Lab reports or diagnostic reports\n"
-        f"  \u2717 Discharge summaries (unless they contain Rx)\n"
-        f"  \u2717 Prescriptions older than 30 days from treatment date\n\n"
-        f"Submit your claim again with the prescription attached.\n"
-        f"If your doctor issued a digital prescription, a clear screenshot or PDF is accepted."
-    )
-
-
-def _msg_missing_hospital_bill(claim_id: str, claim_category: str) -> str:
-    return (
-        f"Claim cannot proceed — Hospital Bill or Clinic Invoice missing.\n\n"
-        f"Your {claim_category} claim (Claim ID: {claim_id}) requires an original itemised bill\n"
-        f"from the treating facility.\n\n"
-        f"What qualifies:\n"
-        f"  \u2713 Printed or handwritten bill from the hospital or clinic\n"
-        f"  \u2713 Shows facility name, address, and contact\n"
-        f"  \u2713 Itemised charges (consultation fee, tests, procedures listed separately)\n"
-        f"  \u2713 Patient name, date of visit, and treating doctor's name\n"
-        f"  \u2713 Total amount paid with payment mode (Cash / UPI / Card)\n"
-        f"  \u2713 Cashier signature or facility stamp\n\n"
-        f"What does NOT qualify:\n"
-        f"  \u2717 Payment SMS or UPI transaction screenshot alone\n"
-        f"  \u2717 Prescription with amount written on it\n"
-        f"  \u2717 Pharmacy bill (this is a separate document)\n"
-        f"  \u2717 Lab report with charges mentioned informally\n\n"
-        f"Note: Small clinics may issue handwritten bills \u2014 these are accepted\n"
-        f"provided the facility name and date are clearly visible."
-    )
-
-
-def _msg_missing_lab_report(claim_id: str) -> str:
-    return (
-        f"Claim cannot proceed — Diagnostic Report missing.\n\n"
-        f"Your Diagnostic claim (Claim ID: {claim_id}) requires the actual test report\n"
-        f"from the laboratory or diagnostic centre.\n\n"
-        f"What qualifies:\n"
-        f"  \u2713 Printed report from the lab with lab name and address\n"
-        f"  \u2713 Shows each test name, result, unit, and normal reference range\n"
-        f"  \u2713 Signed or stamped by a qualified pathologist or radiologist\n"
-        f"  \u2713 Includes sample collection date and report generation date\n"
-        f"  \u2713 Patient name matches your policy record\n\n"
-        f"What does NOT qualify:\n"
-        f"  \u2717 Prescription that mentions tests ordered (not the report itself)\n"
-        f"  \u2717 SMS or email summary of test results\n"
-        f"  \u2717 A photo of the report that is too blurry to read values\n\n"
-        f"NABL-accredited lab reports are preferred but not mandatory.\n"
-        f"If your report spans multiple pages, upload all pages as a single PDF or multiple images."
-    )
-
-
-def _msg_missing_pharmacy_bill(claim_id: str) -> str:
-    return (
-        f"Claim cannot proceed — Pharmacy Bill missing.\n\n"
-        f"Your Pharmacy claim (Claim ID: {claim_id}) requires an itemised bill\n"
-        f"from a registered pharmacy.\n\n"
-        f"What qualifies:\n"
-        f"  \u2713 Bill from a pharmacy with a valid Drug Licence Number (e.g. KA-BLR-XXXX)\n"
-        f"  \u2713 Lists each medicine by name, quantity, MRP, and amount charged\n"
-        f"  \u2713 Shows pharmacist name or stamp\n"
-        f"  \u2713 Date of purchase within 30 days of prescription date\n\n"
-        f"What does NOT qualify:\n"
-        f'  \u2717 Hospital bill that mentions "medicines" as a lump sum\n'
-        f"  \u2717 Online pharmacy order confirmation without itemised breakup\n"
-        f"  \u2717 Prescription alone (even if it shows drug names and doses)\n"
-        f"  \u2717 Handwritten chit from a pharmacy without Drug Licence Number\n\n"
-        f"Important: Medicines must be prescribed by a doctor.\n"
-        f"Over-the-counter purchases without a prescription are not covered."
-    )
-
-
-def _msg_wrong_doc_type(
-    claim_id: str,
-    claim_category: str,
-    uploaded_items: list[tuple[str, str]],
-    required_types: list,
-) -> str:
-    if uploaded_items:
-        filename, detected_type = uploaded_items[0]
-        uploaded_line = f"  Uploaded:  {detected_type}  ({filename})"
-    else:
-        uploaded_line = "  Uploaded:  Unknown document"
-    required_types_list = ", ".join(_readable_doc_type(str(t)) for t in required_types)
-    return (
-        f"Claim on hold \u2014 Incorrect document type detected.\n\n"
-        f"We reviewed your upload for {claim_category} claim (Claim ID: {claim_id}) and found a mismatch:\n\n"
-        f"{uploaded_line}\n"
-        f"  Required:  {required_types_list}\n\n"
-        f"This is a common mix-up. Here is how to tell them apart:\n\n"
-        f"  Prescription  \u2192  Issued by your doctor. Shows diagnosis, medicines,\n"
-        f"                   and doctor's registration number.\n"
-        f"  Hospital Bill \u2192  Issued by the hospital or clinic. Shows charges,\n"
-        f"                   bill number, and total amount paid.\n"
-        f"  Lab Report    \u2192  Issued by the lab. Shows test results with\n"
-        f"                   reference ranges and pathologist's signature.\n"
-        f"  Pharmacy Bill \u2192  Issued by the pharmacy. Shows drug names,\n"
-        f"                   quantities, MRP, and drug licence number.\n\n"
-        f"Your uploaded file has been retained and may count as a supporting document\n"
-        f"if applicable. Please add the correct document and resubmit."
-    )
-
-
-def _msg_unreadable(claim_id: str, claim_category: str, filename: str) -> str:
-    return (
-        f"Claim on hold \u2014 Document could not be read.\n\n"
-        f"The document you uploaded for {claim_category} claim (Claim ID: {claim_id}) could not be\n"
-        f"processed because it is unclear.\n\n"
-        f"File: {filename}\n\n"
-        f"What to reupload:\n"
-        f"  \u2713 Photograph in good lighting, without shadows or glare\n"
-        f"  \u2713 All four corners of the document must be visible\n"
-        f"  \u2713 Minimum resolution: 300 DPI or a standard smartphone camera photo\n"
-        f"  \u2713 If stamped over critical text, request a re-stamped copy from\n"
-        f"    the issuing doctor or facility\n\n"
-        f"Your original upload has been retained. You only need to reupload the affected document."
-    )
-
-
-def _msg_pre_auth_missing(claim_id: str, test_name: str, amount: float, threshold: float) -> str:
-    return (
-        f"Claim on hold \u2014 Pre-Authorization Approval required.\n\n"
-        f"Your Diagnostic claim (Claim ID: {claim_id}) includes a procedure that requires\n"
-        f"prior approval from the insurer before reimbursement can be processed.\n\n"
-        f"Procedure detected: {test_name}\n"
-        f"Claimed amount:     \u20b9{amount:,.0f}\n"
-        f"Pre-auth required:  Yes (mandatory for {test_name} above \u20b9{threshold:,.0f})\n\n"
-        f"If you already have pre-authorization:\n"
-        f"  Upload your Pre-Authorization Approval Letter. The letter must be valid\n"
-        f"  (within 30 days of the procedure date) and show an approval reference number.\n\n"
-        f"If you do not have pre-authorization:\n"
-        f"  Cashless/reimbursement for this procedure cannot be processed without prior\n"
-        f"  approval. Contact Plum support immediately \u2014 approvals cannot be granted\n"
-        f"  retroactively in most cases.\n\n"
-        f"Policy Reference: Section 4 \u2014 Pre-Authorization Requirements"
-    )
-
-
-def _msg_deadline_exceeded(
-    claim_id: str,
-    claim_category: str,
-    treatment_date: date,
-    submitted_on: date,
-    deadline_days: int,
-    days_overdue: int,
-) -> str:
-    deadline_date = treatment_date + timedelta(days=deadline_days)
-    return (
-        f"Claim cannot be processed \u2014 Submission deadline passed.\n\n"
-        f"Your {claim_category} claim (Claim ID: {claim_id}) was submitted outside the allowed window.\n\n"
-        f"Treatment date:    {treatment_date.isoformat()}\n"
-        f"Submission date:   {submitted_on.isoformat()}\n"
-        f"Allowed window:    {deadline_days} days from treatment date\n"
-        f"Deadline was:      {deadline_date.isoformat()}\n"
-        f"Overdue by:        {days_overdue} days\n\n"
-        f"Per your policy, claims must be submitted within {deadline_days} days of the\n"
-        f"treatment date. This claim is not eligible for reimbursement under the standard process.\n\n"
-        f"If you have a valid reason for the delay (hospitalisation, travel, natural disaster),\n"
-        f"you may raise a waiver request with supporting evidence through Plum support.\n"
-        f"Waivers are subject to insurer approval and are not guaranteed."
-    )
-
-
-def _msg_patient_mismatch(
-    claim_id: str,
-    claim_category: str,
-    names_found: list[str],
-    policy_member_name: str,
-    member_id: str,
-    dependents: list[str],
-) -> str:
-    names_joined = ", ".join(names_found)
-    dependent_list = ", ".join(dependents) if dependents else "none listed"
-    return (
-        f"Claim on hold \u2014 Patient name on document does not match policy records.\n\n"
-        f"  Name(s) on documents:  {names_joined}\n"
-        f"  Name on policy:        {policy_member_name}  (Member ID: {member_id})\n\n"
-        f"This could be due to:\n"
-        f'  \u2022 A spelling variation (e.g. "Rajesh" vs "Raj")\n'
-        f"  \u2022 A nickname or informal name used at the clinic\n"
-        f"  \u2022 A document belonging to a different person\n\n"
-        f"What to do:\n"
-        f"  If this is the same person \u2014 upload a government-issued ID (Aadhaar, PAN, or\n"
-        f"  Passport) showing the name as it appears on your policy. Plum will manually\n"
-        f"  verify and proceed.\n\n"
-        f"  If this document belongs to a dependent \u2014 ensure the dependent is listed under\n"
-        f"  your policy. Covered dependents for your account: {dependent_list}\n\n"
-        f"  If this is an error \u2014 contact Plum support to correct your policy name before\n"
-        f"  resubmitting."
-    )
-
-
-def _detailed_missing_doc_message(
-    doc_type: Any,
-    claim_category: str,
-    claim_id: str,
-    member_name: str,
-) -> str:
-    dt = str(doc_type).upper()
-    category_label = _readable_category(claim_category)
-    if dt == "PRESCRIPTION":
-        return _msg_missing_prescription(claim_id, category_label, member_name)
-    if dt == "HOSPITAL_BILL":
-        return _msg_missing_hospital_bill(claim_id, category_label)
-    if dt in ("LAB_REPORT", "DIAGNOSTIC_REPORT"):
-        return _msg_missing_lab_report(claim_id)
-    if dt == "PHARMACY_BILL":
-        return _msg_missing_pharmacy_bill(claim_id)
-    missing_label = _readable_doc_type(dt)
-    return (
-        f"Claim cannot proceed \u2014 {missing_label} missing.\n\n"
-        f"Your {category_label} claim (Claim ID: {claim_id}) requires a {missing_label} "
-        f"but none was found in your submission.\n\n"
-        f"Please upload the required {missing_label} and resubmit."
-    )
-
-
-def _msg_multiple_missing(missing: list, claim_id: str, claim_category: str) -> str:
-    category_label = _readable_category(claim_category)
-    missing_labels = _join_doc_types(missing)
-    return (
-        f"Claim cannot proceed \u2014 Multiple required documents missing.\n\n"
-        f"Your {category_label} claim (Claim ID: {claim_id}) is missing the following "
-        f"required documents: {missing_labels}.\n\n"
-        f"Please upload all required documents and resubmit."
-    )
