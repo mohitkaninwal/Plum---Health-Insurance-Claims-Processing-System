@@ -19,8 +19,24 @@ from app.models.policy import PolicyTerms
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 SAMPLE_DOCUMENTS_GUIDE_PATH = REPO_ROOT / "sample_documents_guide.md"
-EMBEDDING_DIMENSIONS = 64
+EMBEDDING_DIMENSIONS = 384  # all-MiniLM-L6-v2 output dimension
 RRF_K = 60
+
+_sentence_model = None
+_sentence_model_loaded = False
+
+
+def _get_sentence_model():
+    global _sentence_model, _sentence_model_loaded
+    if _sentence_model_loaded:
+        return _sentence_model
+    _sentence_model_loaded = True
+    try:
+        from sentence_transformers import SentenceTransformer  # type: ignore[import-untyped]
+        _sentence_model = SentenceTransformer("all-MiniLM-L6-v2")
+    except Exception:
+        _sentence_model = None
+    return _sentence_model
 
 
 @dataclass(frozen=True)
@@ -134,6 +150,18 @@ def reciprocal_rank_fusion(
 
 
 def embed_text(text_value: str, *, dimensions: int = EMBEDDING_DIMENSIONS) -> list[float]:
+    model = _get_sentence_model()
+    if model is not None:
+        try:
+            embedding = model.encode(text_value, normalize_embeddings=True)
+            return [round(float(v), 6) for v in embedding[:dimensions]]
+        except Exception:
+            pass
+    return _sha256_embed(text_value, dimensions=dimensions)
+
+
+def _sha256_embed(text_value: str, *, dimensions: int = EMBEDDING_DIMENSIONS) -> list[float]:
+    """Deterministic fallback embedding using SHA-256 token hashing."""
     vector = [0.0] * dimensions
     tokens = _keywords(text_value)
     if not tokens:

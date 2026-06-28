@@ -1,11 +1,20 @@
 from __future__ import annotations
 
 import base64
+import difflib
 import io
 import json
+import logging
+from collections import OrderedDict
 from datetime import datetime
 import re
 from typing import Any, NotRequired, TypedDict
+
+logger = logging.getLogger(__name__)
+
+# ── Extraction cache (improvement 6) ─────────────────────────────────────────
+_EXTRACTION_CACHE: OrderedDict[str, Any] = OrderedDict()
+_EXTRACTION_CACHE_MAX = 200
 
 from pydantic import BaseModel, Field, ValidationError
 
@@ -315,6 +324,11 @@ def _structured_normalization_agent(state: _ExtractionState) -> _ExtractionState
     return state
 
 
+def _names_are_similar(a: str, b: str, threshold: float = 0.6) -> bool:
+    """Return True if names are similar enough to be the same person."""
+    return difflib.SequenceMatcher(None, a, b).ratio() >= threshold
+
+
 def _patient_consistency_agent(state: _ExtractionState) -> _ExtractionState:
     extracted = state.get("extracted_documents", [])
     names_by_key: dict[str, list[str]] = {}
@@ -328,8 +342,16 @@ def _patient_consistency_agent(state: _ExtractionState) -> _ExtractionState:
         key = _name_key(name)
         if not key:
             continue
-        names_by_key.setdefault(key, []).append(item.file_id)
-        display_names.setdefault(key, name)
+        # Check if this name is similar to an existing canonical key (fuzzy merge)
+        matched_key = next(
+            (k for k in names_by_key if _names_are_similar(key, k)),
+            None,
+        )
+        if matched_key is not None:
+            names_by_key[matched_key].append(item.file_id)
+        else:
+            names_by_key.setdefault(key, []).append(item.file_id)
+            display_names.setdefault(key, name)
 
     if len(names_by_key) > 1:
         names = [display_names[key] for key in sorted(names_by_key)]
@@ -419,7 +441,9 @@ def _extract_from_uploaded_text(
     if settings.groq_api_key and missing_fields:
         try:
             payload = _request_groq_text_extraction(document_type, text)
-            refined_fields = _normalize_fields(payload.fields)
+            refined_fields = _strip_billing_fields_if_not_bill(
+                _normalize_fields(payload.fields), document_type
+            )
             if refined_fields:
                 parsed_fields = refined_fields
                 missing_fields = payload.missing_fields or _missing_fields(document_type, parsed_fields)
@@ -454,6 +478,7 @@ def _extract_with_groq(
     upload = (document.content or {}).get("upload", {})
     content_base64 = upload.get("base64")
     content_type = upload.get("content_type")
+    sha256 = upload.get("sha256")
 
     if not settings.groq_api_key or not content_base64 or not content_type:
         return _empty_extraction(document, document_type, has_upload_content=bool(content_base64)), ComponentFailure(
@@ -464,13 +489,34 @@ def _extract_with_groq(
             ),
         )
 
-    try:
-        payload = _request_groq_extraction(document_type, content_base64, content_type)
+    if sha256 and sha256 in _EXTRACTION_CACHE:
+        logger.debug("Extraction cache hit for sha256=%s file_id=%s", sha256, document.file_id)
+        payload = _EXTRACTION_CACHE[sha256]
+        _EXTRACTION_CACHE.move_to_end(sha256)
         return ExtractedDocumentData(
             file_id=document.file_id,
             document_type=document_type,
             quality=_quality_from_confidence(payload.confidence, payload.missing_fields),
             fields=payload.fields,
+            missing_fields=payload.missing_fields,
+            confidence=payload.confidence,
+            warnings=payload.warnings,
+        ), None
+
+    try:
+        payload = _request_groq_extraction(document_type, content_base64, content_type)
+        if sha256:
+            _EXTRACTION_CACHE[sha256] = payload
+            _EXTRACTION_CACHE.move_to_end(sha256)
+            if len(_EXTRACTION_CACHE) > _EXTRACTION_CACHE_MAX:
+                _EXTRACTION_CACHE.popitem(last=False)
+            logger.debug("Extraction cached for sha256=%s file_id=%s", sha256, document.file_id)
+        filtered_fields = _strip_billing_fields_if_not_bill(payload.fields, document_type)
+        return ExtractedDocumentData(
+            file_id=document.file_id,
+            document_type=document_type,
+            quality=_quality_from_confidence(payload.confidence, payload.missing_fields),
+            fields=filtered_fields,
             missing_fields=payload.missing_fields,
             confidence=payload.confidence,
             warnings=payload.warnings,
@@ -488,6 +534,12 @@ def _request_groq_extraction(
     from groq import Groq
 
     client = Groq(api_key=settings.groq_api_key)
+    _lab_exclusion = (
+        "Do NOT extract total or line_items for LAB_REPORT or DIAGNOSTIC_REPORT — "
+        "numeric lab reference ranges are not monetary amounts. "
+        if document_type in {DocumentType.LAB_REPORT, DocumentType.DIAGNOSTIC_REPORT}
+        else ""
+    )
     prompt = (
         "Extract structured health-insurance claim fields from this document. Return only JSON "
         "matching this schema: fields object, missing_fields string array, confidence number "
@@ -497,6 +549,7 @@ def _request_groq_extraction(
         "DD/MM/YYYY unless impossible, so 03/11/2024 means 2024-11-03. For pharmacy bills, "
         "line_items must include the medicine description and the row Amount total, not zero, "
         "quantity, or MRP. Use NET AMOUNT or GRAND TOTAL for total when present. "
+        f"{_lab_exclusion}"
         f"The classified document_type is {document_type}."
     )
     response = client.chat.completions.create(
@@ -542,6 +595,12 @@ def _request_groq_text_extraction(document_type: DocumentType, text: str) -> _LL
     from groq import Groq
 
     client = Groq(api_key=settings.groq_api_key)
+    _lab_exclusion = (
+        "Do NOT extract total or line_items for LAB_REPORT or DIAGNOSTIC_REPORT — "
+        "numeric lab reference ranges are not monetary amounts. "
+        if document_type in {DocumentType.LAB_REPORT, DocumentType.DIAGNOSTIC_REPORT}
+        else ""
+    )
     prompt = (
         "Extract structured health-insurance claim fields from this OCR text excerpt. Return only "
         "JSON matching this schema: fields object, missing_fields string array, confidence number "
@@ -551,6 +610,7 @@ def _request_groq_text_extraction(document_type: DocumentType, text: str) -> _LL
         "DD/MM/YYYY unless impossible, so 03/11/2024 means 2024-11-03. For pharmacy bills, "
         "line_items must include the medicine description and the row Amount total, not zero, "
         "quantity, or MRP. Use NET AMOUNT or GRAND TOTAL for total when present. "
+        f"{_lab_exclusion}"
         f"The classified document_type is {document_type}. OCR text excerpt:\n{text[:12000]}"
     )
     response = client.chat.completions.create(
@@ -634,9 +694,9 @@ def _empty_extraction(
         fields["patient_name"] = document.patient_name_on_doc
     missing_fields = _missing_fields(document_type, fields)
     confidence = 0.58 if fields else 0.5
-    # Mark as UNREADABLE only when actual binary content was uploaded but could not be extracted.
-    # When there was no upload content at all (e.g. fixture documents), stay LOW.
-    quality = DocumentQuality.UNREADABLE if has_upload_content and not fields else DocumentQuality.LOW
+    # Stay LOW quality when extraction fails — UNREADABLE is reserved for documents
+    # explicitly flagged as unreadable by the caller (e.g. quality=UNREADABLE on the document).
+    quality = DocumentQuality.LOW
     return ExtractedDocumentData(
         file_id=document.file_id,
         document_type=document_type,
@@ -968,6 +1028,19 @@ def _normalize_extracted_data(data: ExtractedDocumentData) -> ExtractedDocumentD
     if missing_fields and not any("Missing" in warning for warning in warnings):
         warnings.extend(f"Missing {field}." for field in missing_fields)
     return data.model_copy(update={"fields": fields, "missing_fields": missing_fields, "warnings": warnings})
+
+
+_BILLING_ONLY_FIELDS = {"total", "line_items", "invoice_date"}
+_NON_BILLING_DOC_TYPES = {DocumentType.LAB_REPORT, DocumentType.DIAGNOSTIC_REPORT, DocumentType.PRESCRIPTION}
+
+
+def _strip_billing_fields_if_not_bill(
+    fields: dict[str, Any], document_type: DocumentType
+) -> dict[str, Any]:
+    """Remove billing-specific fields (total, line_items) from non-bill document types."""
+    if document_type not in _NON_BILLING_DOC_TYPES:
+        return fields
+    return {k: v for k, v in fields.items() if k not in _BILLING_ONLY_FIELDS}
 
 
 def _normalize_fields(fields: dict[str, Any]) -> dict[str, Any]:

@@ -4,6 +4,7 @@ from typing import Any
 
 import logging
 
+from pydantic import ValidationError
 from sqlalchemy.exc import SQLAlchemyError
 
 logger = logging.getLogger(__name__)
@@ -23,24 +24,38 @@ def persist_claim_intake(response: ClaimResponse) -> ClaimResponse:
     try:
         _replace_claim_intake(response, db)
         db.commit()
-    except Exception as exc:
+    except SQLAlchemyError as exc:
         db.rollback()
-        logger.error("ClaimIntakeRepository persist failed for claim %s: %r", response.claim_id, exc)
+        logger.error(
+            "ClaimIntakeRepository DB error for claim %s: %r",
+            response.claim_id,
+            exc,
+            extra={"claim_id": response.claim_id, "component": "ClaimIntakeRepository"},
+        )
+        if settings.environment.lower() not in {"local", "test"}:
+            response.component_failures.append(
+                ComponentFailure(
+                    component="ClaimIntakeRepository",
+                    message=f"Claim intake metadata could not be persisted: {exc}",
+                )
+            )
+            response.trace.append(
+                TraceEvent(
+                    component="ClaimIntakeRepository",
+                    level=TraceLevel.WARNING,
+                    message="Claim intake metadata persistence failed; processing response was still returned.",
+                )
+            )
+    except ValidationError as exc:
+        db.rollback()
+        logger.error(
+            "ClaimIntakeRepository validation error for claim %s: %r",
+            response.claim_id,
+            exc,
+            extra={"claim_id": response.claim_id, "component": "ClaimIntakeRepository"},
+        )
         if settings.environment.lower() in {"local", "test"}:
-            return response
-        response.component_failures.append(
-            ComponentFailure(
-                component="ClaimIntakeRepository",
-                message=f"Claim intake metadata could not be persisted: {exc}",
-            )
-        )
-        response.trace.append(
-            TraceEvent(
-                component="ClaimIntakeRepository",
-                level=TraceLevel.WARNING,
-                message="Claim intake metadata persistence failed; processing response was still returned.",
-            )
-        )
+            raise
     finally:
         db.close()
     return response
