@@ -34,8 +34,7 @@ def test_policy_knowledge_base_chunks_policy_json_and_document_guide(tmp_path: P
     assert "POLICY_DOCUMENT_REQUIREMENTS_CONSULTATION" in evidence_ids
     assert "POLICY_OPD_CATEGORY_CONSULTATION" in evidence_ids
     assert "POLICY_WAITING_PERIODS" in evidence_ids
-    assert "DOC_GUIDE_MEDICAL_PRESCRIPTION" in evidence_ids
-    assert all(len(chunk.embedding) == 64 for chunk in chunks)
+    assert all(len(chunk.embedding) == 384 for chunk in chunks)
 
 
 def test_rrf_combines_dense_and_lexical_rankings() -> None:

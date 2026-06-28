@@ -367,6 +367,31 @@ def test_rule_engine_rejects_pre_auth_missing_for_high_value_diagnostic() -> Non
 # ---------------------------------------------------------------------------
 
 
+def test_rule_engine_routes_high_value_claim_to_manual_review() -> None:
+    # auto_manual_review_above is ₹25,000. A ₹26,000 claim must go to manual review.
+    response = process_claim(
+        _base_submission(
+            claimed_amount=26000,
+            documents=[
+                {
+                    "file_id": "RX",
+                    "actual_type": "PRESCRIPTION",
+                    "content": {"patient_name": "Rajesh Kumar", "diagnosis": "Fever"},
+                },
+                {
+                    "file_id": "BILL",
+                    "actual_type": "HOSPITAL_BILL",
+                    "content": {"patient_name": "Rajesh Kumar", "total": 26000},
+                },
+            ],
+        )
+    )
+
+    assert response.decision is not None
+    assert response.decision.decision == "MANUAL_REVIEW"
+    assert "High-value" in response.reason or "manual review" in response.reason.lower()
+
+
 def test_rule_engine_routes_fraud_signal_to_manual_review() -> None:
     # Same-day claims limit is 2. EMP008 already has 3 claims on 2024-10-30,
     # making this the 4th — triggering the fraud detection rule.

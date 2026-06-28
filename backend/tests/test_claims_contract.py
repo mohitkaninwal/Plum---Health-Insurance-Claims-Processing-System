@@ -120,7 +120,7 @@ def test_get_claim_context_returns_policy_and_members() -> None:
     assert payload["members"][0]["member_id"] == "EMP001"
     assert payload["members"][0]["name"] == "Rajesh Kumar"
     assert "DEP001" in payload["members"][0]["dependents"]
-    assert "DEP003" in payload["unresolved_dependent_ids"]
+    assert payload["unresolved_dependent_ids"] == []
 
 
 def test_submit_claim_stops_for_patient_not_in_selected_member_family() -> None:
@@ -186,8 +186,8 @@ def test_get_member_ytd_uses_claim_history(monkeypatch) -> None:
             pass
 
     rows = [
-        SimpleNamespace(claim_id="CLM_1", claimed_amount=1200),
-        SimpleNamespace(claim_id="CLM_2", claimed_amount=800),
+        SimpleNamespace(claim_id="CLM_1", approved_amount=1200),
+        SimpleNamespace(claim_id="CLM_2", approved_amount=800),
     ]
     monkeypatch.setattr(claims_api, "SessionLocal", lambda: FakeSession(rows))
 
@@ -417,13 +417,13 @@ def test_component_failure_is_visible_without_crashing() -> None:
 
     response = client.post(
         "/claims/submit",
+        headers={"X-Simulate-Failure": "true"},
         json={
             "member_id": "EMP006",
             "policy_id": "PLUM_GHI_2024",
             "claim_category": "ALTERNATIVE_MEDICINE",
             "treatment_date": "2024-10-28",
             "claimed_amount": 4000,
-            "simulate_component_failure": True,
             "documents": [
                 {"file_id": "F021", "actual_type": "PRESCRIPTION", "content": {"diagnosis": "Joint Pain"}},
                 {"file_id": "F022", "actual_type": "HOSPITAL_BILL", "content": {"total": 4000}},

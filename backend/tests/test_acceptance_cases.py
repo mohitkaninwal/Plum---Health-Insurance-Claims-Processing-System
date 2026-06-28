@@ -484,13 +484,13 @@ def test_tc010_network_hospital_discount_applied_before_copay() -> None:
 def test_tc011_component_failure_does_not_crash_pipeline() -> None:
     response = client.post(
         "/claims/submit",
+        headers={"X-Simulate-Failure": "true"},
         json={
             "member_id": "EMP006",
             "policy_id": "PLUM_GHI_2024",
             "claim_category": "ALTERNATIVE_MEDICINE",
             "treatment_date": "2024-10-28",
             "claimed_amount": 4000,
-            "simulate_component_failure": True,
             "documents": [
                 {
                     "file_id": "F021",

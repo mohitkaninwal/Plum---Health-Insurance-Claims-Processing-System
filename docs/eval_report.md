@@ -1,7 +1,7 @@
 # Eval Report
 
-Generated: 2026-06-28 06:27 UTC  
-Eval run ID: `EVAL_AF513FCF10DA`  
+Generated: 2026-06-28 11:18 UTC  
+Eval run ID: `EVAL_D380D9698A0A`  
 Cases: 12/12
 
 ## Aggregate Metrics
@@ -49,7 +49,7 @@ Cases: 12/12
 
 1. `ClaimIntakeAPI` [INFO] — Claim submission accepted.
 2. `DocumentClassifier` [INFO] — Documents classified for early intake validation.
-3. `DocumentVerifierAgent` [WARNING] (-0.20) — A Hospital Bill is required for Consultation claims but was not found among your uploads.
+3. `DocumentVerifierAgent` [WARNING] (-0.20) — A HOSPITAL_BILL document is required for CONSULTATION claims, but only PRESCRIPTION and PRESCRIPTION documents were uploaded.
 
 ---
 
@@ -252,7 +252,7 @@ Cases: 12/12
 7. `PatientConsistencyAgent` [INFO] — Extracted patient identity fields are consistent or unavailable.
 8. `RuleEngine` [WARNING] (-0.21) — Claim on hold — Pre-Authorization Approval required.
 
-Your Diagnostic claim (Claim ID: CLM_7D15E369FAFA) includes a procedure that requires
+Your Diagnostic claim (Claim ID: CLM_F8C5E3BE2FD9) includes a procedure that requires
 prior approval from the insurer before reimbursement can be processed.
 
 Procedure detected: MRI
