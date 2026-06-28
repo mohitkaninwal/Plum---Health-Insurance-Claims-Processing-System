@@ -21,11 +21,10 @@ Accepts a claim submission (member details, treatment type, claimed amount, uplo
 ├── plan.md                    # Phase-wise implementation notes
 ├── backend/                   # FastAPI + LangGraph Python backend
 ├── frontend/                  # Next.js ops review UI
-├── docs/
-│   ├── architecture_design.md # Full architecture design (Eraser.io-ready)
-│   ├── component_contracts.md # Typed contracts for every component
-│   └── eval_report.md         # Results for all 12 test cases
-└── data/                      # Symlinks to policy and test data
+└── docs/
+    ├── architecture_design.md # Full architecture design (Eraser.io-ready)
+    ├── component_contracts.md # Typed contracts for every component
+    └── eval_report.md         # Results for all 12 test cases
 ```
 
 ---
@@ -34,270 +33,255 @@ Accepts a claim submission (member details, treatment type, claimed amount, uplo
 
 ### High-Level Layers
 
-```
-┌─────────────────────────────────────────────────────┐
-│                   PRESENTATION LAYER                │
-│              Next.js 15 + React 19 + TypeScript     │
-│         Submit Tab │ Decision Tab │ Eval Tab         │
-└──────────────────────────┬──────────────────────────┘
-                           │ REST API (HTTP/JSON)
-┌──────────────────────────▼──────────────────────────┐
-│                    API GATEWAY LAYER                │
-│              FastAPI (Python 3.11+)                 │
-│     /claims  │  /eval  │  /health  (CORS enabled)  │
-└──────────────────────────┬──────────────────────────┘
-                           │
-┌──────────────────────────▼──────────────────────────┐
-│                   SERVICES LAYER                    │
-│  Document Intake  │  Extraction Pipeline            │
-│  Policy Loader    │  Policy Retriever               │
-│  Claims Processor │  Claim Intake Repository        │
-└──────────────────────────┬──────────────────────────┘
-                           │
-┌──────────────────────────▼──────────────────────────┐
-│                   DATA LAYER                        │
-│   PostgreSQL + pgvector │  In-Memory (local mode)   │
-│   13 Tables + Vector Embeddings (64-dim)            │
-└──────────────────────────┬──────────────────────────┘
-                           │
-┌──────────────────────────▼──────────────────────────┐
-│                  EXTERNAL SERVICES                  │
-│          Groq API (Llama 4 Scout Vision)            │
-└─────────────────────────────────────────────────────┘
+```mermaid
+graph TB
+    A["PRESENTATION LAYER<br/>Next.js 15 · React 19 · TypeScript<br/>Submit Tab | Decision Tab | Eval Tab"]
+    B["API GATEWAY LAYER<br/>FastAPI · Python 3.11+<br/>/claims | /eval | /health"]
+    C["SERVICES LAYER<br/>Document Intake · Extraction Pipeline<br/>Policy Loader · Policy Retriever<br/>Claims Processor · Claim Intake Repository"]
+    D["DATA LAYER<br/>PostgreSQL + pgvector<br/>13 Tables · Vector Embeddings (64-dim)"]
+    E["EXTERNAL SERVICES<br/>Groq API — Llama 4 Scout Vision"]
+
+    A -->|REST API HTTP/JSON| B
+    B --> C
+    C --> D
+    C -->|Vision extraction| E
 ```
 
 ### End-to-End Data Flow
 
-```
-USER (Browser)
-     │
-     │  1. Upload Documents (multipart form)
-     ▼
- FRONTEND (Next.js)
-     │
-     │  POST /claims/parse/upload
-     ▼
- FastAPI
-     │
-     ├──► document_intake.py (classify + encode files)
-     ├──► extraction_pipeline.py (LangGraph, 4 agents)
-     │         └──► Groq Vision API (optional)
-     │
-     │  DocumentParseResult (fields + confidence)
-     ▼
- FRONTEND
-     │  (auto-fill form fields from parse result)
-     │
-     │  2. Submit Claim (JSON)
-     │  POST /claims/submit
-     ▼
- FastAPI
-     │
-     ├──► claims_processor.py
-     │         ├──► extraction_pipeline.py (re-extract if needed)
-     │         ├──► policy_retriever.py (get evidence)
-     │         └──► 35+ rule checks
-     │
-     ├──► claim_intake_repository.py (persist to DB)
-     │
-     │  ClaimResponse (decision + trace + evidence)
-     ▼
- FRONTEND
-     │  (display decision, trace, evidence, line items)
-     ▼
- USER (sees APPROVED / PARTIAL / REJECTED / MANUAL_REVIEW)
+```mermaid
+sequenceDiagram
+    actor User
+    participant FE as Frontend (Next.js)
+    participant API as FastAPI
+    participant DI as document_intake.py
+    participant EP as extraction_pipeline.py
+    participant CP as claims_processor.py
+    participant PR as policy_retriever.py
+    participant DB as claim_intake_repository.py
+    participant Groq
+
+    User->>FE: 1. Upload documents
+    FE->>API: POST /claims/parse/upload
+    API->>DI: classify + encode files
+    DI->>EP: run LangGraph pipeline
+    EP-->>Groq: vision extraction (optional)
+    Groq-->>EP: extracted fields
+    EP-->>API: DocumentParseResult
+    API-->>FE: fields + confidence scores
+    FE-->>User: auto-fill form
+
+    User->>FE: 2. Submit claim
+    FE->>API: POST /claims/submit
+    API->>CP: process_claim()
+    CP->>EP: re-extract if needed
+    CP->>PR: get policy evidence
+    PR-->>CP: PolicyEvidence (top-5 chunks)
+    CP-->>API: ClaimDecision (35+ rules applied)
+    API->>DB: persist claim + documents
+    API-->>FE: ClaimResponse
+    FE-->>User: APPROVED / PARTIAL / REJECTED / MANUAL_REVIEW
 ```
 
 ---
 
 ## Document Extraction Pipeline (LangGraph)
 
-A stateful 4-agent pipeline orchestrated with LangGraph. Each agent has typed input/output edges and a defined failure fallback.
+A stateful 4-agent pipeline orchestrated with LangGraph. Each agent has typed edges and a defined failure fallback.
 
-```
-Input: UploadedDocument list
-         │
-         ▼
-┌─────────────────────────────────────┐
-│    Agent 1: Document Verifier       │
-│  - Classify document type           │
-│  - Flag low/unknown quality docs    │
-│  - Confidence impact: -0.03 (low)   │
-│  Output: DocumentClassification     │
-└──────────────────┬──────────────────┘
-                   │
-                   ▼
-┌─────────────────────────────────────┐
-│   Agent 2: Vision Extraction        │
-│                                     │
-│  Priority fallback chain:           │
-│  1. Fixture content (test mode)     │
-│  2. Uploaded text content           │
-│  3. Groq Llama 4 Scout (Vision)     │
-│     Model: llama-4-scout-17b        │
-│     Max retries: 3                  │
-│                                     │
-│  Extracts per doc type:             │
-│  - Prescription: patient, drugs,    │
-│    diagnosis, prescriber            │
-│  - Hospital Bill: hospital, total,  │
-│    invoice_date, services           │
-│  - Lab Report: tests, results       │
-│  - Pharmacy: drugs, total           │
-│  - Discharge Summary: admission,    │
-│    discharge, diagnosis             │
-└──────────────────┬──────────────────┘
-                   │
-                   ▼
-┌─────────────────────────────────────┐
-│  Agent 3: Structured Normalization  │
-│  - Pydantic validation              │
-│  - Normalize dates, amounts, names  │
-│  - Handle missing fields            │
-│  Output: ExtractedDocumentData      │
-└──────────────────┬──────────────────┘
-                   │
-                   ▼
-┌─────────────────────────────────────┐
-│  Agent 4: Patient Consistency       │
-│  - Match patient name to members    │
-│  - Flag name mismatches             │
-│  - Set action_required if mismatch  │
-│  Output: ExtractionPipelineResult   │
-└──────────────────┬──────────────────┘
-                   │
-                   ▼
-         claims_processor.py (continues)
+```mermaid
+flowchart TD
+    IN([UploadedDocument list]) --> A1
+
+    A1["Agent 1 — Document Verifier
+    • Classify document type
+    • Flag low / unknown quality
+    • Confidence impact: −0.03 per low-quality doc
+    ─────────────────────────────
+    Output: DocumentClassification"]
+
+    A1 --> A2
+
+    A2["Agent 2 — Vision Extraction
+    Fallback chain:
+    1 · Fixture content (test mode)
+    2 · Uploaded text content
+    3 · Groq Llama 4 Scout Vision (max 3 retries)
+    ─────────────────────────────
+    Extracts: patient, drugs, diagnosis,
+    hospital, total, services, dates"]
+
+    A2 --> A3
+
+    A3["Agent 3 — Structured Normalization
+    • Pydantic v2 validation
+    • Normalize dates, amounts, names
+    • Handle missing / null fields
+    ─────────────────────────────
+    Output: ExtractedDocumentData"]
+
+    A3 --> A4
+
+    A4["Agent 4 — Patient Consistency
+    • Match patient name to policy members
+    • Flag name mismatches
+    • Set action_required on mismatch
+    ─────────────────────────────
+    Output: ExtractionPipelineResult"]
+
+    A4 --> OUT([claims_processor.py — continues])
+
+    style IN  fill:#e8f4f8,stroke:#4a90d9
+    style OUT fill:#e8f4f8,stroke:#4a90d9
+    style A1  fill:#fff8e1,stroke:#f9a825
+    style A2  fill:#fff8e1,stroke:#f9a825
+    style A3  fill:#fff8e1,stroke:#f9a825
+    style A4  fill:#fff8e1,stroke:#f9a825
 ```
 
-**Fast-path:** If documents were already extracted at parse time and content hasn't changed, the pipeline skips Agent 2 and reuses cached extraction results.
+> **Fast-path:** If documents were already extracted during `/parse/upload` and content hasn't changed, Agent 2 is skipped and cached results are reused.
 
 ---
 
 ## Claims Adjudication Rules Engine
 
-35+ deterministic Python rules applied in strict order. No LLM is involved in adjudication — full auditability is guaranteed.
+35+ deterministic Python rules applied in strict order. No LLM is involved in adjudication — full auditability guaranteed.
 
-```
-Input: ClaimSubmission + PolicyTerms
-         │
-    ┌────▼────────────────────────────────────────────────┐
-    │  GATE RULES (immediate REJECTED on fail)            │
-    │  ├─ [R01] Policy ID mismatch                        │
-    │  ├─ [R02] Member not found in policy                │
-    │  ├─ [R03] Policy not active (date check)            │
-    │  ├─ [R04] Submission deadline exceeded              │
-    │  ├─ [R05] Amount below minimum threshold            │
-    │  └─ [R06] Claim category not covered                │
-    └────┬────────────────────────────────────────────────┘
-         │
-    ┌────▼────────────────────────────────────────────────┐
-    │  DOCUMENT RULES (ACTION_REQUIRED on fail)           │
-    │  ├─ [D01] Required documents missing                │
-    │  ├─ [D02] Document quality too low (UNREADABLE)     │
-    │  └─ [D03] Patient name inconsistency (vs policy)    │
-    └────┬────────────────────────────────────────────────┘
-         │
-    ┌────▼────────────────────────────────────────────────┐
-    │  COVERAGE RULES (REJECTED on fail)                  │
-    │  ├─ [C01] Condition exclusion check                 │
-    │  ├─ [C02] Dental exclusion check                    │
-    │  ├─ [C03] Vision exclusion check                    │
-    │  ├─ [C04] Initial waiting period                    │
-    │  ├─ [C05] Pre-existing condition waiting period     │
-    │  └─ [C06] Specific condition waiting period         │
-    └────┬────────────────────────────────────────────────┘
-         │
-    ┌────▼────────────────────────────────────────────────┐
-    │  FINANCIAL RULES (PARTIAL on constraint hit)        │
-    │  ├─ [F01] Per-claim limit cap                       │
-    │  ├─ [F02] Annual OPD limit check                    │
-    │  ├─ [F03] Family floater limit check                │
-    │  ├─ [F04] Co-pay deduction (per category %)         │
-    │  └─ [F05] Sub-limit per OPD category                │
-    └────┬────────────────────────────────────────────────┘
-         │
-    ┌────▼────────────────────────────────────────────────┐
-    │  COMPLIANCE RULES                                   │
-    │  ├─ [X01] Pre-authorization required check          │
-    │  ├─ [X02] Network hospital validation               │
-    │  └─ [X03] MANUAL_REVIEW if pre-auth not confirmed   │
-    └────┬────────────────────────────────────────────────┘
-         │
-    ┌────▼────────────────────────────────────────────────┐
-    │  FRAUD DETECTION                                    │
-    │  ├─ [FR1] Same-day claims count threshold           │
-    │  ├─ [FR2] Monthly claims count threshold            │
-    │  ├─ [FR3] High-value claim threshold                │
-    │  └─ [FR4] Composite fraud score → MANUAL_REVIEW     │
-    └────┬────────────────────────────────────────────────┘
-         │
-    ┌────▼────────────────────────────────────────────────┐
-    │  LINE ITEM ADJUDICATION (multi-service claims)      │
-    │  └─ Per line: APPROVED / REJECTED / ADJUSTED /      │
-    │               REVIEW                                │
-    └────┬────────────────────────────────────────────────┘
-         │
-    ┌────▼────────────────────────────────────────────────┐
-    │  CONFIDENCE SCORING (0.0 – 1.0)                     │
-    │  Base: 0.9                                          │
-    │  Deductions:                                        │
-    │  - Low quality docs: -0.03 each                     │
-    │  - Missing fields: -0.05 each                       │
-    │  - Component failures: -0.1 each                    │
-    │  - No policy evidence: -0.15                        │
-    └────┬────────────────────────────────────────────────┘
-         │
-         ▼
-   ClaimDecision
-   ├── decision: APPROVED | PARTIAL | REJECTED | MANUAL_REVIEW
-   ├── approved_amount: Float
-   ├── claimed_amount: Float
-   ├── confidence: 0.0–1.0
-   ├── rejection_reasons: List[str]
-   └── line_item_decisions: List[LineItemDecision]
+```mermaid
+flowchart TD
+    IN([ClaimSubmission + PolicyTerms]) --> GATE
+
+    GATE["GATE RULES — immediate REJECTED on fail
+    R01 · Policy ID mismatch
+    R02 · Member not found in policy
+    R03 · Policy not active (date check)
+    R04 · Submission deadline exceeded
+    R05 · Amount below minimum threshold
+    R06 · Claim category not covered"]
+
+    GATE -->|pass| DOC
+
+    DOC["DOCUMENT RULES — ACTION_REQUIRED on fail
+    D01 · Required documents missing
+    D02 · Document quality too low (UNREADABLE)
+    D03 · Patient name inconsistency vs policy"]
+
+    DOC -->|pass| COV
+
+    COV["COVERAGE RULES — REJECTED on fail
+    C01 · Condition exclusion check
+    C02 · Dental exclusion check
+    C03 · Vision exclusion check
+    C04 · Initial waiting period
+    C05 · Pre-existing condition waiting period
+    C06 · Specific condition waiting period"]
+
+    COV -->|pass| FIN
+
+    FIN["FINANCIAL RULES — PARTIAL on constraint hit
+    F01 · Per-claim limit cap
+    F02 · Annual OPD limit check
+    F03 · Family floater limit check
+    F04 · Co-pay deduction (per category %)
+    F05 · Sub-limit per OPD category"]
+
+    FIN -->|pass| COMP
+
+    COMP["COMPLIANCE RULES
+    X01 · Pre-authorization required check
+    X02 · Network hospital validation
+    X03 · MANUAL_REVIEW if pre-auth not confirmed"]
+
+    COMP -->|pass| FRAUD
+
+    FRAUD["FRAUD DETECTION
+    FR1 · Same-day claims count threshold
+    FR2 · Monthly claims count threshold
+    FR3 · High-value claim threshold
+    FR4 · Composite fraud score → MANUAL_REVIEW"]
+
+    FRAUD -->|pass| LINE
+
+    LINE["LINE ITEM ADJUDICATION
+    Per service line:
+    APPROVED / REJECTED / ADJUSTED / REVIEW"]
+
+    LINE --> CONF
+
+    CONF["CONFIDENCE SCORING (0.0 – 1.0)
+    Base: 0.9
+    −0.03 per low-quality doc
+    −0.05 per missing field
+    −0.10 per component failure
+    −0.15 if no policy evidence found"]
+
+    CONF --> OUT
+
+    OUT(["ClaimDecision
+    decision · approved_amount · claimed_amount
+    confidence · rejection_reasons · line_items"])
+
+    GATE -->|fail| REJ([REJECTED])
+    DOC  -->|fail| ACT([ACTION_REQUIRED])
+    COV  -->|fail| REJ
+    COMP -->|pre-auth| MAN([MANUAL_REVIEW])
+    FRAUD-->|score high| MAN
+
+    style IN   fill:#e8f4f8,stroke:#4a90d9
+    style OUT  fill:#e8f4f8,stroke:#4a90d9
+    style GATE fill:#fdecea,stroke:#e53935
+    style DOC  fill:#fff3e0,stroke:#fb8c00
+    style COV  fill:#fdecea,stroke:#e53935
+    style FIN  fill:#fffde7,stroke:#fdd835
+    style COMP fill:#e8f5e9,stroke:#43a047
+    style FRAUD fill:#fdecea,stroke:#e53935
+    style LINE fill:#e8f5e9,stroke:#43a047
+    style CONF fill:#e8f5e9,stroke:#43a047
+    style REJ  fill:#fdecea,stroke:#e53935
+    style ACT  fill:#fff3e0,stroke:#fb8c00
+    style MAN  fill:#fffde7,stroke:#fdd835
 ```
 
 ---
 
 ## Policy Retrieval (Hybrid Search)
 
-Policy evidence is retrieved using a hybrid search engine combining dense vector search and lexical keyword matching, fused with Reciprocal Rank Fusion (RRF).
+Policy evidence is retrieved by combining dense vector search and lexical keyword matching, fused with Reciprocal Rank Fusion (RRF).
 
-```
-Input: ClaimSubmission + ClaimCategory
-              │
-              ▼
-    ┌──────────────────────┐
-    │  Query Construction  │
-    │  claim_category +    │
-    │  submission summary  │
-    └──────┬───────────────┘
-           │
-    ┌──────▼───────────────────────────────────────┐
-    │            Hybrid Search Engine              │
-    │                                              │
-    │  ┌─────────────────┐  ┌──────────────────┐  │
-    │  │  Dense Search   │  │  Lexical Search   │  │
-    │  │  (pgvector)     │  │  (keyword match)  │  │
-    │  │  64-dim embed   │  │                   │  │
-    │  │  (SHA256-based, │  │  Token overlap    │  │
-    │  │   deterministic)│  │  scoring          │  │
-    │  └────────┬────────┘  └────────┬──────────┘  │
-    │           │                    │              │
-    │           └────────┬───────────┘              │
-    │                    ▼                          │
-    │     Reciprocal Rank Fusion (RRF)              │
-    │     score = Σ 1/(k + rank)  [k=60]            │
-    │     Returns top-5 evidence chunks             │
-    └────────────────────┬─────────────────────────┘
-                         │
-                         ▼
-              PolicyEvidence list
-              (with hybrid scores, raw text, citations)
+```mermaid
+flowchart TD
+    IN([ClaimSubmission + ClaimCategory]) --> QC
+
+    QC["Query Construction
+    claim_category + submission summary"]
+
+    QC --> DS & LS
+
+    DS["Dense Search
+    pgvector — 64-dim embeddings
+    SHA256-based (deterministic)"]
+
+    LS["Lexical Search
+    Keyword / token-overlap scoring"]
+
+    DS --> RRF
+    LS --> RRF
+
+    RRF["Reciprocal Rank Fusion
+    score = Σ 1/(k + rank), k = 60
+    Returns top-5 evidence chunks"]
+
+    RRF --> OUT(["PolicyEvidence list
+    hybrid scores · raw text · citations"])
+
+    style IN  fill:#e8f4f8,stroke:#4a90d9
+    style OUT fill:#e8f4f8,stroke:#4a90d9
+    style RRF fill:#f3e5f5,stroke:#8e24aa
+    style DS  fill:#e8f5e9,stroke:#43a047
+    style LS  fill:#e8f5e9,stroke:#43a047
 ```
 
-**Indexed knowledge chunks:** `coverage_limits`, `opd_category`, `waiting_periods`, `exclusions`, `pre_authorization`, `submission_rules`, `fraud_thresholds`, `network_hospitals`
+**Indexed knowledge chunks:** `coverage_limits` · `opd_category` · `waiting_periods` · `exclusions` · `pre_authorization` · `submission_rules` · `fraud_thresholds` · `network_hospitals`
 
 ---
 
@@ -309,7 +293,7 @@ Input: ClaimSubmission + ClaimCategory
 |---|---|
 | Framework | Next.js 15 (App Router) |
 | UI | React 19 + TypeScript 5.5 |
-| State | React hooks (no Redux/Zustand) |
+| State | React hooks only |
 | API state | TanStack React Query |
 | Styling | Tailwind CSS 3.4 + PostCSS |
 | Icons | Lucide React |
@@ -346,17 +330,17 @@ Input: ClaimSubmission + ClaimCategory
 
 | Decision | Choice | Reason |
 |---|---|---|
-| LLM Framework | LangGraph (not plain LangChain) | Stateful multi-agent pipeline with typed edges |
+| LLM Framework | LangGraph | Stateful multi-agent pipeline with typed edges |
 | LLM Provider | Groq (Llama 4 Scout) | Vision capability for medical doc images |
-| Vector DB | pgvector (in PostgreSQL) | Avoid separate vector DB; reuse existing Postgres |
-| Embeddings | Deterministic (SHA256-based) | No LLM API call needed for indexing; reproducible |
+| Vector DB | pgvector (in PostgreSQL) | Avoids a separate vector DB service |
+| Embeddings | Deterministic (SHA256-based) | No LLM call needed for indexing; fully reproducible |
 | Hybrid Search | Dense + Lexical + RRF | Better recall than pure semantic or keyword alone |
-| DB Optional | In-memory fallback | Enables zero-config local development |
-| LLM Optional | Deterministic fallback | System works without Groq API key for testing |
-| Frontend | Single-page (no routing) | Simple 3-tab UX for ops team; no complex navigation |
+| DB Optional | In-memory fallback | Zero-config local development |
+| LLM Optional | Deterministic fallback | System works without a Groq key for testing |
+| Frontend | Single-page (3 tabs) | Simple ops-team UX; no complex navigation needed |
 | State | React hooks only | No Redux/Zustand needed for this scope |
 | Auth | None | Internal ops tool; authentication deferred |
-| Rules Engine | Deterministic Python (not LLM) | Full auditability; no LLM hallucination in decisions |
+| Rules Engine | Deterministic Python | Full auditability; no LLM hallucination in decisions |
 
 ---
 
@@ -365,7 +349,7 @@ Input: ClaimSubmission + ClaimCategory
 | Layer | Trigger | Behavior |
 |---|---|---|
 | LLM Unavailable | No `GROQ_API_KEY` or Groq API down | Falls back to deterministic extraction from text content |
-| Database Unavailable | `DATABASE_URL` not set or DB unreachable | In-memory operation; policy loaded from JSON |
+| Database Unavailable | `DATABASE_URL` not set or DB unreachable | In-memory mode; policy loaded from JSON |
 | Low Quality Document | Doc marked `UNREADABLE` or `LOW` | Returns `ACTION_REQUIRED`; prompts user to re-upload |
 | Name Mismatch | Patient name doesn't match any policy member | Returns `ACTION_REQUIRED`; asks user to confirm member |
 | Component Failure | Any service throws unexpected exception | `ComponentFailure` recorded; confidence reduced; `MANUAL_REVIEW` if too many |
@@ -378,10 +362,8 @@ Input: ClaimSubmission + ClaimCategory
 
 - Python 3.11+
 - Node.js 18+
-- A Postgres database with the `pgvector` extension enabled (see [Neon](https://neon.tech) for a free hosted option)
-- A [Groq API key](https://console.groq.com) for document classification and field extraction (optional — the system falls back to filename inference and fixture data without it)
-
----
+- PostgreSQL with `pgvector` extension ([Neon](https://neon.tech) offers a free hosted option)
+- Groq API key (optional — system falls back to deterministic mode without it)
 
 ### Backend
 
@@ -390,118 +372,58 @@ cd backend
 python -m venv .venv
 source .venv/bin/activate       # Windows: .venv\Scripts\activate
 pip install -r requirements-dev.txt
-```
-
-Copy the environment file and fill in your values:
-
-```bash
-cp .env.example .env
-```
-
-**Backend environment variables (`.env`)**
-
-| Variable | Required | Default | Description |
-|---|---|---|---|
-| `DATABASE_URL` | yes* | `postgresql+psycopg://postgres:postgres@localhost:5432/plum_claims` | Postgres connection string with `pgvector` extension. Use `postgresql+psycopg://` scheme (psycopg v3). |
-| `GROQ_API_KEY` | no | `""` | Groq API key for Llama-4-Scout vision extraction and document classification. Without this, the system uses filename inference and fixture content only. |
-| `ENVIRONMENT` | no | `local` | Set to `local` or `test` to suppress database errors on startup. Set to `production` for strict mode. |
-| `CORS_ORIGINS` | no | `http://localhost:3000` | Comma-separated list of allowed CORS origins. |
-| `APP_NAME` | no | `Plum Claims API` | Application name shown in OpenAPI docs. |
-
-\* If `DATABASE_URL` is empty and `ENVIRONMENT` is `local`, the backend starts without a database — policy evidence retrieval falls back to in-memory mode and claim persistence is skipped.
-
-Run database migrations:
-
-```bash
+cp .env.example .env            # fill in DATABASE_URL and GROQ_API_KEY
 alembic upgrade head
-```
-
-Start the API server:
-
-```bash
 uvicorn app.main:app --reload
 ```
 
-Verify the backend is running:
-
-```bash
-curl http://localhost:8000/health
-# {"status":"ok"}
-```
+Verify: `curl http://localhost:8000/health` → `{"status":"ok"}`
 
 Interactive API docs: [http://localhost:8000/docs](http://localhost:8000/docs)
-
----
 
 ### Frontend
 
 ```bash
 cd frontend
 npm install
-cp .env.example .env.local
-```
-
-**Frontend environment variables (`.env.local`)**
-
-| Variable | Required | Default | Description |
-|---|---|---|---|
-| `NEXT_PUBLIC_API_BASE_URL` | yes | `http://localhost:8000` | Base URL of the FastAPI backend. Change this when pointing at a deployed backend. |
-
-Start the dev server:
-
-```bash
+cp .env.example .env.local      # set NEXT_PUBLIC_API_BASE_URL
 npm run dev
 ```
 
 Frontend: [http://localhost:3000](http://localhost:3000)
 
----
-
-### Running Tests
+### Tests
 
 ```bash
 cd backend
-pytest
-```
-
-To run a specific test file:
-
-```bash
+pytest                          # runs in-memory, no DB required
 pytest tests/test_claims_contract.py -v
 ```
 
-The test suite runs in-memory (no database required). The `ENVIRONMENT=test` default in `pytest.ini` / `pyproject.toml` suppresses database connection errors.
-
----
-
-### Running the Eval Suite
-
-With the backend running locally, trigger the eval from the UI (Eval tab) or directly:
+### Eval Suite
 
 ```bash
+# With backend running:
 curl -X POST http://localhost:8000/eval/run | python -m json.tool
+# Or use the Eval tab in the UI
 ```
-
-All 12 test cases are run and results are returned in a single response. See `docs/eval_report.md` for the pre-run results.
 
 ---
 
 ## Deployment
 
-The system is designed to deploy on:
-
 | Layer | Target |
 |---|---|
-| Backend | [Render](https://render.com) web service — `uvicorn app.main:app --host 0.0.0.0 --port $PORT` |
-| Frontend | Render static site or web service — `npm run build && npm start` |
-| Database | [Neon](https://neon.tech) Postgres with `pgvector` extension enabled |
-| LLM | [Groq](https://console.groq.com) API — `meta-llama/llama-4-scout-17b-16e-instruct` |
+| Backend | [Render](https://render.com) — `uvicorn app.main:app --host 0.0.0.0 --port $PORT` |
+| Frontend | Render — `npm run build && npm start` |
+| Database | [Neon](https://neon.tech) Postgres with `pgvector` |
+| LLM | [Groq](https://console.groq.com) — `meta-llama/llama-4-scout-17b-16e-instruct` |
 
-Set the same environment variables listed above in your Render service dashboard. Set `ENVIRONMENT=production` in deployed environments.
+Set `ENVIRONMENT=production` in deployed environments.
 
 ---
 
-## Quick API Reference
+## API Reference
 
 | Method | Path | Purpose |
 |---|---|---|
@@ -509,16 +431,16 @@ Set the same environment variables listed above in your Render service dashboard
 | `GET` | `/claims/context` | Policy metadata + member roster |
 | `GET` | `/claims/members/{member_id}/ytd` | YTD used/remaining amounts per category |
 | `POST` | `/claims/submit` | Submit a claim as JSON |
-| `POST` | `/claims/submit/upload` | Submit a claim with real file uploads |
+| `POST` | `/claims/submit/upload` | Submit a claim with file uploads |
 | `POST` | `/claims/parse/upload` | Extract document fields only (no adjudication) |
 | `GET` | `/claims/{claim_id}` | Fetch a claim response and full trace |
-| `POST` | `/eval/run` | Run all 12 test cases and return metrics |
+| `POST` | `/eval/run` | Run all 12 test cases |
 | `GET` | `/eval/latest` | Fetch the last eval run |
 
 ---
 
 ## Key Documents
 
-- **`docs/architecture_design.md`** — Full architecture design with all diagrams, ready for Eraser.io visual presentation.
-- **`docs/component_contracts.md`** — Typed input/output/error contracts for every component. Start here to understand or reimplement any part of the system.
-- **`docs/eval_report.md`** — Decision accuracy on all 12 test cases with full traces.
+- **`docs/architecture_design.md`** — Full architecture design with all diagrams, ready for Eraser.io
+- **`docs/component_contracts.md`** — Typed input/output/error contracts for every component
+- **`docs/eval_report.md`** — Decision accuracy on all 12 test cases with full traces
