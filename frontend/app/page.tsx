@@ -637,6 +637,7 @@ export default function Home() {
     setClaimResponse(null);
     setHasReviewResult(false);
     setParseResponse(null);
+    setSubmitValidationError(null);
     void parseUploadedDocuments(nextDraft);
   }
 
@@ -960,6 +961,7 @@ export default function Home() {
                               const nextDraft = { ...draft, documents: nextDocuments };
                               setDraft(nextDraft);
                               setParseResponse(null);
+                              setSubmitValidationError(null);
                               if (nextDocuments.some((doc) => doc.file)) {
                                 void parseUploadedDocuments(nextDraft);
                               } else {
