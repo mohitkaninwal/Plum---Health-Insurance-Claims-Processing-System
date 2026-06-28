@@ -15,6 +15,8 @@ def clear_extraction_cache() -> None:
     could silently satisfy a later test's assertions via a stale cache hit,
     masking real extraction failures.
     """
-    extraction_pipeline._EXTRACTION_CACHE.clear()
+    with extraction_pipeline._CACHE_LOCK:
+        extraction_pipeline._EXTRACTION_CACHE.clear()
     yield
-    extraction_pipeline._EXTRACTION_CACHE.clear()
+    with extraction_pipeline._CACHE_LOCK:
+        extraction_pipeline._EXTRACTION_CACHE.clear()

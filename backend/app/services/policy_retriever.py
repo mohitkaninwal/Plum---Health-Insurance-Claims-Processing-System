@@ -4,6 +4,7 @@ import hashlib
 import json
 import math
 import re
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -25,6 +26,7 @@ RRF_K = 60
 
 _sentence_model = None
 _sentence_model_loaded = False
+_MODEL_LOCK = threading.Lock()
 
 
 def _get_sentence_model():
@@ -41,7 +43,10 @@ def _get_sentence_model():
     global _sentence_model, _sentence_model_loaded
     if _sentence_model_loaded:
         return _sentence_model
-    _sentence_model_loaded = True
+    with _MODEL_LOCK:
+        if _sentence_model_loaded:
+            return _sentence_model
+        _sentence_model_loaded = True
     if not settings.enable_embeddings:
         # Fast path: skip torch import entirely to keep RSS well below 512 MB.
         _sentence_model = None

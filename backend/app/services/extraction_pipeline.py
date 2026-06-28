@@ -5,6 +5,8 @@ import difflib
 import io
 import json
 import logging
+import random
+import threading
 import time
 from collections import OrderedDict
 from datetime import datetime
@@ -32,17 +34,21 @@ def _groq_retryable(exc: Exception) -> bool:
 # ── Extraction cache ──────────────────────────────────────────────────────────
 _EXTRACTION_CACHE: OrderedDict[str, Any] = OrderedDict()
 _EXTRACTION_CACHE_MAX = 200
+_CACHE_LOCK = threading.Lock()
 
 # ── LangGraph compiled graph singleton ────────────────────────────────────────
 # Compiling the graph is non-trivial. Doing it once at first use (not on every
 # request) avoids the repeated compilation overhead.
 _COMPILED_GRAPH: Any = None
+_GRAPH_LOCK = threading.Lock()
 
 
 def _get_compiled_graph() -> Any:
     global _COMPILED_GRAPH
     if _COMPILED_GRAPH is None:
-        _COMPILED_GRAPH = _build_graph()
+        with _GRAPH_LOCK:
+            if _COMPILED_GRAPH is None:
+                _COMPILED_GRAPH = _build_graph()
     return _COMPILED_GRAPH
 
 from pydantic import BaseModel, Field, ValidationError
@@ -456,6 +462,7 @@ def _extract_from_uploaded_text(
     try:
         content = base64.b64decode(content_base64)
     except Exception:
+        logger.warning("Failed to decode base64 for %s", document.file_id, exc_info=True)
         return None
 
     text = _uploaded_text(content, content_type, document.file_name or "")
@@ -524,27 +531,29 @@ def _extract_with_groq(
             ),
         )
 
-    if sha256 and sha256 in _EXTRACTION_CACHE:
-        logger.debug("Extraction cache hit for sha256=%s file_id=%s", sha256, document.file_id)
-        payload = _EXTRACTION_CACHE[sha256]
-        _EXTRACTION_CACHE.move_to_end(sha256)
-        return ExtractedDocumentData(
-            file_id=document.file_id,
-            document_type=document_type,
-            quality=_quality_from_confidence(payload.confidence, payload.missing_fields),
-            fields=payload.fields,
-            missing_fields=payload.missing_fields,
-            confidence=payload.confidence,
-            warnings=payload.warnings,
-        ), None
+    with _CACHE_LOCK:
+        if sha256 and sha256 in _EXTRACTION_CACHE:
+            logger.debug("Extraction cache hit for sha256=%s file_id=%s", sha256, document.file_id)
+            payload = _EXTRACTION_CACHE[sha256]
+            _EXTRACTION_CACHE.move_to_end(sha256)
+            return ExtractedDocumentData(
+                file_id=document.file_id,
+                document_type=document_type,
+                quality=_quality_from_confidence(payload.confidence, payload.missing_fields),
+                fields=payload.fields,
+                missing_fields=payload.missing_fields,
+                confidence=payload.confidence,
+                warnings=payload.warnings,
+            ), None
 
     try:
         payload = _request_groq_extraction(document_type, content_base64, content_type)
         if sha256:
-            _EXTRACTION_CACHE[sha256] = payload
-            _EXTRACTION_CACHE.move_to_end(sha256)
-            if len(_EXTRACTION_CACHE) > _EXTRACTION_CACHE_MAX:
-                _EXTRACTION_CACHE.popitem(last=False)
+            with _CACHE_LOCK:
+                _EXTRACTION_CACHE[sha256] = payload
+                _EXTRACTION_CACHE.move_to_end(sha256)
+                if len(_EXTRACTION_CACHE) > _EXTRACTION_CACHE_MAX:
+                    _EXTRACTION_CACHE.popitem(last=False)
             logger.debug("Extraction cached for sha256=%s file_id=%s", sha256, document.file_id)
         filtered_fields = _strip_billing_fields_if_not_bill(payload.fields, document_type)
         return ExtractedDocumentData(
@@ -573,12 +582,24 @@ def _call_groq_with_retry(client: Any, **kwargs: Any) -> Any:
     last_exc: Exception | None = None
     for attempt in range(_GROQ_RETRY_ATTEMPTS):
         try:
-            return client.chat.completions.create(**kwargs)
+            start = time.monotonic()
+            response = client.chat.completions.create(**kwargs)
+            elapsed = time.monotonic() - start
+            usage = getattr(response, "usage", None)
+            logger.info(
+                "Groq call succeeded model=%s elapsed=%.2fs prompt_tokens=%s completion_tokens=%s total_tokens=%s",
+                kwargs.get("model", "unknown"),
+                elapsed,
+                getattr(usage, "prompt_tokens", None),
+                getattr(usage, "completion_tokens", None),
+                getattr(usage, "total_tokens", None),
+            )
+            return response
         except Exception as exc:
             if not _groq_retryable(exc):
                 raise
             last_exc = exc
-            delay = _GROQ_RETRY_BASE_DELAY * (2**attempt)
+            delay = _GROQ_RETRY_BASE_DELAY * (2**attempt) + random.uniform(0, _GROQ_RETRY_BASE_DELAY)
             logger.warning(
                 "Groq transient error on attempt %d/%d; retrying in %.1fs. error=%r",
                 attempt + 1,
@@ -595,7 +616,7 @@ def _request_groq_extraction(
 ) -> _LLMExtractionPayload:
     from groq import Groq
 
-    client = Groq(api_key=settings.groq_api_key)
+    client = Groq(api_key=settings.groq_api_key, timeout=settings.groq_timeout_seconds)
     _lab_exclusion = (
         "Do NOT extract total or line_items for LAB_REPORT or DIAGNOSTIC_REPORT — "
         "numeric lab reference ranges are not monetary amounts. "
@@ -658,7 +679,7 @@ def _request_groq_extraction(
 def _request_groq_text_extraction(document_type: DocumentType, text: str) -> _LLMExtractionPayload:
     from groq import Groq
 
-    client = Groq(api_key=settings.groq_api_key)
+    client = Groq(api_key=settings.groq_api_key, timeout=settings.groq_timeout_seconds)
     _lab_exclusion = (
         "Do NOT extract total or line_items for LAB_REPORT or DIAGNOSTIC_REPORT — "
         "numeric lab reference ranges are not monetary amounts. "
@@ -796,6 +817,7 @@ def _uploaded_text(content: bytes, content_type: str, file_name: str) -> str | N
             reader = PdfReader(io.BytesIO(content))
             pages = [page.extract_text() or "" for page in reader.pages]
         except Exception:
+            logger.warning("Failed to parse PDF for %s", file_name, exc_info=True)
             return None
         text = "\n".join(page.strip() for page in pages if page and page.strip())
         return text or None

@@ -3,10 +3,14 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import logging
+import time
 from datetime import date
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated
+
+logger = logging.getLogger(__name__)
 
 from fastapi import File, Form, UploadFile
 
@@ -235,8 +239,9 @@ def _classify_with_groq_vision(
     try:
         from groq import Groq
 
-        client = Groq(api_key=settings.groq_api_key)
+        client = Groq(api_key=settings.groq_api_key, timeout=settings.groq_timeout_seconds)
         encoded = base64.b64encode(content).decode("ascii")
+        start = time.monotonic()
         response = client.chat.completions.create(
             model="meta-llama/llama-4-scout-17b-16e-instruct",
             messages=[
@@ -263,6 +268,16 @@ def _classify_with_groq_vision(
             ],
             temperature=0,
         )
+        elapsed = time.monotonic() - start
+        usage = getattr(response, "usage", None)
+        logger.info(
+            "Groq vision call succeeded model=meta-llama/llama-4-scout-17b-16e-instruct "
+            "elapsed=%.2fs prompt_tokens=%s completion_tokens=%s total_tokens=%s",
+            elapsed,
+            getattr(usage, "prompt_tokens", None),
+            getattr(usage, "completion_tokens", None),
+            getattr(usage, "total_tokens", None),
+        )
         payload = json.loads(response.choices[0].message.content or "{}")
         return document.model_copy(
             update={
@@ -271,6 +286,7 @@ def _classify_with_groq_vision(
             }
         )
     except Exception:
+        logger.warning("Groq vision classification failed for %s", document.file_id, exc_info=True)
         return document
 
 

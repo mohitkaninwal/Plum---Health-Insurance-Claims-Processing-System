@@ -1,5 +1,6 @@
 from app.models import ClaimSubmission
 from app.services.claims_processor import process_claim
+from app.services.extraction_pipeline import _names_are_similar
 from app.services.policy_loader import read_policy_terms
 
 
@@ -473,3 +474,24 @@ def test_rule_engine_rejects_excluded_condition_obesity() -> None:
     assert response.decision is not None
     assert response.decision.decision == "REJECTED"
     assert "EXCLUDED_CONDITION" in response.rejection_reasons
+
+
+# ---------------------------------------------------------------------------
+# Boundary conditions
+# ---------------------------------------------------------------------------
+
+
+def test_rule_engine_approves_claim_at_exact_per_claim_limit() -> None:
+    """A claim exactly at the per-claim limit (₹5,000) should be approved, not rejected."""
+    submission = _base_submission(claimed_amount=5000)
+    response = process_claim(submission)
+
+    assert response.decision is not None
+    assert response.decision.decision != "REJECTED" or "PER_CLAIM_EXCEEDED" not in response.rejection_reasons
+
+
+def test_names_are_similar_with_special_characters() -> None:
+    """Hyphens, periods, and accents should not break name matching."""
+    assert _names_are_similar("Dr. Rajesh Kumar", "Dr Rajesh Kumar")
+    assert _names_are_similar("Anne-Marie Smith", "Anne Marie Smith")
+    assert not _names_are_similar("Rajesh Kumar", "Completely Different")

@@ -8,6 +8,7 @@ from app.models import ClaimSubmission, DocumentQuality, DocumentType
 from app.services.extraction_pipeline import (
     _EXTRACTION_CACHE,
     _EXTRACTION_CACHE_MAX,
+    _call_groq_with_retry,
     _names_are_similar,
     _strip_billing_fields_if_not_bill,
     run_extraction_pipeline,
@@ -195,3 +196,86 @@ def test_claims_processor_stops_for_unreadable_documents() -> None:
     assert response.status == "ACTION_REQUIRED"
     assert response.member_action_required is not None
     assert response.member_action_required.code == "UNREADABLE_DOCUMENT"
+
+
+# ---------------------------------------------------------------------------
+# Groq retry / failure path tests
+# ---------------------------------------------------------------------------
+
+
+class _RateLimitError(Exception):
+    """Simulates a Groq RateLimitError for retry testing."""
+    pass
+
+
+# Make the class name match what _groq_retryable checks
+_RateLimitError.__name__ = "RateLimitError"
+
+
+def test_groq_retry_exhaustion_propagates_error() -> None:
+    """After 3 consecutive retryable errors, _call_groq_with_retry should raise."""
+    client = MagicMock()
+    client.chat.completions.create.side_effect = _RateLimitError("rate limited")
+
+    with patch("app.services.extraction_pipeline.time.sleep"):
+        try:
+            _call_groq_with_retry(client, model="test-model", messages=[])
+            assert False, "Expected _RateLimitError to be raised"
+        except _RateLimitError:
+            pass
+
+    assert client.chat.completions.create.call_count == 3
+
+
+def test_call_groq_with_retry_succeeds_on_second_attempt() -> None:
+    """First call fails with a retryable error, second succeeds."""
+    fake_response = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content='{"fields":{}}'))],
+        usage=SimpleNamespace(prompt_tokens=10, completion_tokens=5, total_tokens=15),
+    )
+    client = MagicMock()
+    client.chat.completions.create.side_effect = [
+        _RateLimitError("rate limited"),
+        fake_response,
+    ]
+
+    with patch("app.services.extraction_pipeline.time.sleep"):
+        result = _call_groq_with_retry(client, model="test-model", messages=[])
+
+    assert result is fake_response
+    assert client.chat.completions.create.call_count == 2
+
+
+def test_groq_empty_response_returns_empty_extraction() -> None:
+    """When Groq returns empty content, extraction should still produce a result."""
+    fake_payload = SimpleNamespace(
+        fields={},
+        missing_fields=["patient_name", "diagnosis"],
+        confidence=0.0,
+        warnings=["Empty response from LLM"],
+    )
+    submission = _make_submission(
+        documents=[
+            {
+                "file_id": "IMG1",
+                "file_name": "bill.jpg",
+                "content": {
+                    "upload": {
+                        "base64": "dGVzdA==",
+                        "content_type": "image/jpeg",
+                        "sha256": "empty_test_sha",
+                    }
+                },
+            }
+        ]
+    )
+
+    with patch(
+        "app.services.extraction_pipeline._request_groq_extraction",
+        return_value=fake_payload,
+    ):
+        result = run_extraction_pipeline(submission)
+
+    assert result is not None
+    assert len(result.extracted_documents) == 1
+    assert result.extracted_documents[0].fields == {}

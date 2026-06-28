@@ -62,6 +62,20 @@ from app.services.rules.fraud_rules import fraud_reason as _fraud_reason
 
 TEST_CASES_PATH = Path(__file__).resolve().parents[3] / "test_cases.json"
 
+# ── Confidence scoring constants ─────────────────────────────────────────────
+_CONFIDENCE_BASE = 0.97
+_CONFIDENCE_MIN = 0.50
+_CONFIDENCE_MAX = 0.99
+_PENALTY_UNREADABLE = 0.35
+_PENALTY_LOW_QUALITY = 0.05
+_PENALTY_UNKNOWN_QUALITY = 0.02
+_PENALTY_COMPONENT_FAILURE = 0.08
+_PENALTY_MISSING_FIELD_RATE = 0.025
+_PENALTY_MISSING_FIELD_CAP = 0.14
+_PENALTY_WEAK_EVIDENCE = 0.04
+_EXTRACTION_CONFIDENCE_WEIGHT = 0.2
+_EVIDENCE_STRENGTH_THRESHOLD = 0.02
+
 
 # ── Rule-check helper ─────────────────────────────────────────────────────────
 
@@ -552,13 +566,13 @@ def _confidence_score(
     rule_certainty_impact: float = 0,
 ) -> float:
     inputs = _confidence_inputs(submission, evidence, extracted_documents, component_failures or [])
-    score = 0.97
+    score = _CONFIDENCE_BASE
     score += inputs["document_quality_impact"]
     score += inputs["extraction_completeness_impact"]
     score += inputs["policy_evidence_impact"]
     score += rule_certainty_impact
     score += inputs["component_failure_impact"]
-    return round(max(0.5, min(0.99, score)), 2)
+    return round(max(_CONFIDENCE_MIN, min(_CONFIDENCE_MAX, score)), 2)
 
 
 def _confidence_inputs(
@@ -584,16 +598,16 @@ def _confidence_inputs(
     )
 
     document_quality_impact = (
-        -0.35 * unreadable_count
-        - 0.05 * low_quality_count
-        - 0.02 * unknown_quality_count
+        -_PENALTY_UNREADABLE * unreadable_count
+        - _PENALTY_LOW_QUALITY * low_quality_count
+        - _PENALTY_UNKNOWN_QUALITY * unknown_quality_count
     )
     extraction_completeness_impact = 0.0
     if extracted_documents:
-        extraction_completeness_impact -= min(0.14, 0.025 * missing_field_count)
-        extraction_completeness_impact -= max(0.0, 0.9 - average_extraction_confidence) * 0.2
-    policy_evidence_impact = 0.0 if evidence_strength >= 0.02 else -0.04
-    component_failure_impact = -0.08 * len(component_failures)
+        extraction_completeness_impact -= min(_PENALTY_MISSING_FIELD_CAP, _PENALTY_MISSING_FIELD_RATE * missing_field_count)
+        extraction_completeness_impact -= max(0.0, 0.9 - average_extraction_confidence) * _EXTRACTION_CONFIDENCE_WEIGHT
+    policy_evidence_impact = 0.0 if evidence_strength >= _EVIDENCE_STRENGTH_THRESHOLD else -_PENALTY_WEAK_EVIDENCE
+    component_failure_impact = -_PENALTY_COMPONENT_FAILURE * len(component_failures)
 
     return {
         "document_quality": [str(quality) for quality in qualities],

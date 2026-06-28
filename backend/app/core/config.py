@@ -32,6 +32,7 @@ class Settings(BaseSettings):
     # retrieval still works but loses semantic similarity ranking.
     # Set ENABLE_EMBEDDINGS=true only on instances with ≥ 1 GB RAM.
     enable_embeddings: bool = Field(default=False, validation_alias="ENABLE_EMBEDDINGS")
+    groq_timeout_seconds: int = Field(default=15, validation_alias="GROQ_TIMEOUT_SECONDS")
 
     @property
     def cors_origins(self) -> list[str]:

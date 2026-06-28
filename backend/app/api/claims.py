@@ -1,3 +1,4 @@
+import asyncio
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
@@ -97,7 +98,7 @@ async def get_member_ytd(member_id: str, request: Request, as_of_date: str | Non
 async def submit_claim(request: Request, submission: ClaimSubmission) -> ClaimResponse:
     policy = getattr(request.app.state, "policy_terms", None)
     simulate_failure = request.headers.get("X-Simulate-Failure", "").lower() == "true"
-    response = process_claim(submission, policy=policy, simulate_failure=simulate_failure)
+    response = await asyncio.to_thread(process_claim, submission, policy=policy, simulate_failure=simulate_failure)
     response = persist_claim_intake(response)
     if SessionLocal is None:
         _CLAIMS[response.claim_id] = response
@@ -116,7 +117,7 @@ async def submit_claim_upload(
     policy = getattr(request.app.state, "policy_terms", None)
     simulate_failure = request.headers.get("X-Simulate-Failure", "").lower() == "true"
     submission = await submission_from_upload_form(form)
-    response = process_claim(submission, policy=policy, simulate_failure=simulate_failure)
+    response = await asyncio.to_thread(process_claim, submission, policy=policy, simulate_failure=simulate_failure)
     response = response_without_upload_payloads(response)
     response = persist_claim_intake(response)
     if SessionLocal is None:
@@ -134,7 +135,7 @@ async def parse_claim_upload(
     form: Annotated[ParseDocumentForm, Depends()]
 ) -> DocumentParseResult:
     submission = await submission_from_parse_form(form)
-    parsed = run_extraction_pipeline(submission)
+    parsed = await asyncio.to_thread(run_extraction_pipeline, submission)
     return DocumentParseResult(
         extracted_documents=parsed.extracted_documents,
         trace=parsed.trace,

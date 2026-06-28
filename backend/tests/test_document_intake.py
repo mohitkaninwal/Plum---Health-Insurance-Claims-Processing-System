@@ -1,8 +1,11 @@
 """Tests for document_intake.py — filename inference and classification fallback."""
 from __future__ import annotations
 
+import logging
+from unittest.mock import patch, MagicMock
+
 from app.models import DocumentQuality, DocumentType, UploadedDocument
-from app.services.document_intake import classify_document
+from app.services.document_intake import classify_document, _classify_with_groq_vision
 
 
 def _doc(
@@ -80,3 +83,33 @@ def test_classify_infers_dental_report_from_filename() -> None:
     for name in ("dental_report.pdf", "dental_xray.jpg", "dental_invoice.pdf"):
         result = classify_document(_doc(file_name=name))
         assert result.classification.document_type == DocumentType.DENTAL_REPORT, f"failed for {name}"
+
+
+# ---------------------------------------------------------------------------
+# Groq vision failure paths
+# ---------------------------------------------------------------------------
+
+
+def test_classify_with_groq_vision_logs_warning_on_failure() -> None:
+    """When Groq vision classification fails, it should log a warning and return the original document."""
+    document = _doc(file_id="IMG1", file_name="scan.jpg")
+    content = b"fake image bytes"
+
+    import app.services.document_intake as di
+
+    with patch.object(di.logger, "warning") as mock_warn:
+        with patch("groq.Groq", side_effect=Exception("API down")):
+            result = _classify_with_groq_vision(document, content, "image/jpeg")
+
+    mock_warn.assert_called_once()
+    assert "IMG1" in str(mock_warn.call_args)
+    assert result.file_id == "IMG1"
+    assert result.actual_type is None  # unchanged
+
+
+def test_pdf_extraction_handles_corrupted_bytes() -> None:
+    """Corrupted PDF bytes should not crash _uploaded_text; it should return None."""
+    from app.services.extraction_pipeline import _uploaded_text
+
+    result = _uploaded_text(b"\x00\x01\x02garbage", "application/pdf", "corrupted.pdf")
+    assert result is None

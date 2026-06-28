@@ -1,3 +1,5 @@
+import asyncio
+
 from fastapi import APIRouter, Request
 
 from app.models import ClaimStatus, EvalMetrics, EvalRun
@@ -17,7 +19,7 @@ async def run_eval(request: Request) -> EvalRun:
     global _LATEST_EVAL_RUN
 
     policy = getattr(request.app.state, "policy_terms", None)
-    _LATEST_EVAL_RUN = run_test_case_eval(policy=policy)
+    _LATEST_EVAL_RUN = await asyncio.to_thread(run_test_case_eval, policy=policy)
     return _LATEST_EVAL_RUN
 
 
