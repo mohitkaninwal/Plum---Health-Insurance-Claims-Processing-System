@@ -262,8 +262,8 @@ Orchestrates a four-node LangGraph pipeline that classifies, extracts, normalise
 
 | Node | Component Name | Responsibility |
 |---|---|---|
-| 1 | `DocumentVerifierAgent` | Re-classifies documents; flags low/unknown quality; applies `-0.03` confidence impact per low-quality file |
-| 2 | `VisionExtractionAgent` | For each document: uses fixture content if present, else calls Groq Vision; validates output with Pydantic; applies `-0.08` per extraction failure and `-0.02×n` per missing field |
+| 1 | `DocumentVerifierAgent` | Re-classifies documents; flags low quality (`LOW` only — not `UNKNOWN`); applies `-0.03` confidence impact per low-quality file |
+| 2 | `VisionExtractionAgent` | For each document: tries fixture content → uploaded text → Groq Vision → `_empty_extraction` fallback in order; validates output with Pydantic; applies `-0.08` per extraction failure and `-0.02×n` per missing field; after all docs are processed, if any document has `quality == UNREADABLE`, sets `member_action_required` with code `UNREADABLE_DOCUMENT` |
 | 3 | `StructuredNormalizationAgent` | Normalises field aliases (e.g. `patientName → patient_name`, `amount → total`), snake-cases keys, parses amounts, normalises line items |
 | 4 | `PatientConsistencyAgent` | Compares `patient_name` across all documents; if >1 distinct name found, sets `member_action_required` with code `PATIENT_MISMATCH` and applies `-0.25` confidence impact |
 
@@ -275,7 +275,7 @@ Orchestrates a four-node LangGraph pipeline that classifies, extracts, normalise
 | `extracted_documents` | `ExtractedDocumentData[]` | One entry per input document |
 | `trace` | `TraceEvent[]` | One event per node |
 | `component_failures` | `ComponentFailure[]` | Recoverable failures (e.g. Groq timeouts) |
-| `member_action_required` | `MemberActionRequired \| null` | Set if patient names are inconsistent |
+| `member_action_required` | `MemberActionRequired \| null` | Set if patient names are inconsistent (`PATIENT_MISMATCH`) or if any extracted document is unreadable (`UNREADABLE_DOCUMENT`) |
 | `confidence_impact` | `float` | Cumulative negative impact on confidence score |
 
 **`ExtractedDocumentData` fields**
@@ -284,10 +284,21 @@ Orchestrates a four-node LangGraph pipeline that classifies, extracts, normalise
 |---|---|
 | `file_id` | `string` |
 | `document_type` | `DocumentType` |
+| `quality` | `DocumentQuality` — derived from confidence + missing fields |
 | `fields` | `dict[str, Any]` — normalised key-value pairs |
 | `missing_fields` | `string[]` — required fields absent after extraction |
 | `confidence` | `float [0,1]` |
 | `warnings` | `string[]` |
+
+**`quality` derivation rule (`_quality_from_confidence`)**
+
+| Condition | Quality |
+|---|---|
+| `confidence >= 0.8` and no missing fields | `GOOD` |
+| `confidence >= 0.5` | `LOW` |
+| `confidence < 0.5` | `UNREADABLE` |
+| Upload content present but all extraction attempts failed | `UNREADABLE` |
+| No upload content (fixture document, no binary payload) | `LOW` |
 
 **Required fields by document type**
 
@@ -592,7 +603,7 @@ Called at application startup. In `local`/`test` environments, database failures
 
 | Field | Type |
 |---|---|
-| `code` | `string` — `MISSING_REQUIRED_DOCUMENT`, `UNREADABLE_DOCUMENT`, `PATIENT_MISMATCH` |
+| `code` | `string` — `MISSING_REQUIRED_DOCUMENT` (wrong/missing doc type gate), `UNREADABLE_DOCUMENT` (pre-extraction quality gate **or** post-extraction failure on uploaded binary), `PATIENT_MISMATCH` (extraction pipeline consistency check) |
 | `message` | `string` — specific, actionable instruction |
 | `affected_file_ids` | `string[]` |
 | `required_document_types` | `DocumentType[]` |
